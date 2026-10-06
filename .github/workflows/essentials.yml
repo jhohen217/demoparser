@@ -6,15 +6,19 @@ permissions:
   contents: read
 jobs:
   windows:
-    runs-on: windows-latest
+    # The pinned DuckDB/fmt dependency still uses stdext::checked_array_iterator,
+    # which MSVC 14.51 removed. Use the supported Visual Studio 2022 toolchain.
+    runs-on: windows-2022
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            DemoWriter
-            src/demoparser_rust
+            DemoWriter -> ../target
+            src/demoparser_rust -> ../../target
       - name: Writer library tests
         working-directory: DemoWriter
         run: cargo test --locked --all-targets
@@ -25,10 +29,11 @@ jobs:
         run: python scripts/build.py
       - name: Application library tests
         working-directory: src/demoparser_rust
-        run: cargo test --locked --lib
+        # Reuse the release DuckDB build rather than compiling it again in debug.
+        run: cargo test --release --locked --lib
       - name: Downloader library tests
         working-directory: src/demoparser_rust
-        run: cargo test --locked -p demofetch --lib
+        run: cargo test --release --locked -p demofetch --lib
       - name: Check integrated map command
         run: |
           ./out/Demoparser.exe retarget --help

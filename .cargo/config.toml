@@ -1,0 +1,4 @@
+[env]
+# Bundled DuckDB requires an explicit C++ standard and exception handling on MSVC.
+# Apply this to builds and tests without changing flags for other platforms.
+CXXFLAGS_x86_64_pc_windows_msvc = { value = "/std:c++17 /EHsc", force = false }

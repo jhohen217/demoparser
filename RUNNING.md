@@ -28,3 +28,14 @@ provide their separate advanced operations. The optional collection GUI is sourc
 
 Keep original demos and use new output names. Structural checks and parser checks establish
 different levels of validity; neither substitutes for playback on the intended CS2 client.
+
+## Building from source
+
+Use Rust stable, Python 3 and Visual Studio 2022 Build Tools with the C++ workload
+and Windows SDK. Run `python scripts/build.py` from the repository root. The checked-in
+Cargo configuration supplies `/std:c++17 /EHsc` for Windows x64 C++ dependencies.
+Keep the `.cargo` directory when copying the source.
+
+CI uses `windows-2022` because the pinned DuckDB dependency includes an older fmt
+implementation that references `stdext::checked_array_iterator`. MSVC 14.51 removed
+that type; see [Microsoft's compatibility patch](https://github.com/microsoft/PowerToys/blob/main/deps/vcpkg-overlays/spdlog/msvc-14.51-stdext-checked-array-iterator.patch).
