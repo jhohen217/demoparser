@@ -1,5 +1,6 @@
-use crate::first_pass::prop_controller::ITEM_PURCHASE_DEF_IDX;
 use crate::first_pass::prop_controller::is_grenade_or_weapon;
+use crate::first_pass::prop_controller::ITEM_PURCHASE_DEF_IDX;
+use crate::first_pass::prop_controller::{ECON_ATTRIBUTE_COUNT_ID, ECON_ATTRIBUTE_DEF_INDEX_BASE, ECON_ATTRIBUTE_RAW_VALUE_BASE, ECON_ATTRIBUTE_LEGACY_DEF_ID, ECON_ATTRIBUTE_LEGACY_DEF_SLOT_ID, FLATTENED_VEC_MAX_LEN};
 use crate::first_pass::read_bits::Bitreader;
 use crate::first_pass::read_bits::DemoParserError;
 use crate::first_pass::sendtables::find_field;
@@ -24,8 +25,12 @@ const HUFFMAN_CODE_MAXLEN: u32 = 17;
 pub struct Entity {
     pub cls_id: u32,
     pub entity_id: i32,
+    /// Source entity serial paired with the index to distinguish reused slots.
+    pub serial: u32,
     pub props: AHashMap<u32, Variant>,
     pub entity_type: EntityType,
+    /// Raw two-bit PVS transition code when the packet supplied one.
+    pub pvs_state: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,7 +72,8 @@ impl<'a> SecondPassParser<'a> {
         for _ in 0..msg.updated_entries() {
             entity_id += 1 + (bitreader.read_u_bit_var()? as i32);
             // Read 2 bits to know which operation should be done to the entity.
-            let cmd = match bitreader.read_nbits(2)? {
+            let raw_cmd = bitreader.read_nbits(2)?;
+            let cmd = match raw_cmd {
                 0b01 => EntityCmd::Delete,
                 0b11 => EntityCmd::Delete,
                 0b10 => EntityCmd::CreateAndUpdate,
@@ -77,24 +83,120 @@ impl<'a> SecondPassParser<'a> {
 
             match cmd {
                 EntityCmd::Delete => {
+                    let transition = if raw_cmd == 0b11 { "delete" } else { "leave" };
+                    let recipe_identity = self.entities.get(entity_id as usize)
+                        .and_then(|entry| entry.as_ref())
+                        .map(|entity| (entity.serial, entity.cls_id));
+                    if raw_cmd == 0b11 {
+                        if let Some((serial, _cls_id)) = recipe_identity {
+                            self.ag2_recipes.end(entity_id, serial, self.tick);
+                        }
+                    }
+                    self.capture_utility_entity(entity_id, Some(transition));
+                    self.audit_lifecycle(entity_id, transition);
+                    self.world_entity_lifecycle(entity_id, raw_cmd != 0b11);
                     self.projectiles.remove(&entity_id);
+                    self.smoke_voxels.finish_entity(entity_id, self.tick);
+                    self.infernos.remove(entity_id, self.tick);
+                    if self.prop_controller.capture_weapon_entities {
+                        let deleted = self
+                            .entities
+                            .get(entity_id as usize)
+                            .and_then(|entry| entry.as_ref())
+                            .cloned()
+                            .and_then(|entity| self.snapshot_weapon_entity(&entity));
+                        if let Some(mut snapshot) = deleted {
+                            snapshot.present = false;
+                            self.weapon_entity_snapshots.push(snapshot);
+                        }
+                    }
                     if let Some(entry) = self.entities.get_mut(entity_id as usize) {
                         *entry = None;
                     }
                 }
                 EntityCmd::CreateAndUpdate => {
-                    self.create_new_entity(&mut bitreader, &entity_id, &mut events_to_emit)?;
+                    self.create_new_entity(&mut bitreader, &entity_id, &mut events_to_emit, is_fullpacket)?;
                     self.update_entity(&mut bitreader, entity_id, false, &mut events_to_emit, is_fullpacket)?;
-                }
-                EntityCmd::Update => {
-                    if msg.has_pvs_vis_bits_deprecated() != 0 {
-                        // Most entities pass trough here. Seems like entities that are not updated.
-                        if bitreader.read_nbits(2)? & 0x01 == 1 {
-                            continue;
+                    // Do not wait for the periodic collection callback: short-lived
+                    // dropped weapons can otherwise be deleted before their create is seen.
+                    if self.prop_controller.capture_weapon_entities {
+                        let created = self
+                            .entities
+                            .get(entity_id as usize)
+                            .and_then(|entry| entry.as_ref())
+                            .and_then(|entity| self.snapshot_weapon_entity(entity));
+                        if let Some(snapshot) = created {
+                            self.weapon_entity_snapshots.push(snapshot);
                         }
                     }
-                    self.update_entity(&mut bitreader, entity_id, false, &mut events_to_emit, is_fullpacket)?;
                 }
+                EntityCmd::Update => {
+                    let active_weapon_before = if self.prop_controller.capture_weapon_entities {
+                        self.active_weapon_entity(entity_id)
+                    } else {
+                        None
+                    };
+                    if msg.has_pvs_vis_bits_deprecated() != 0 {
+                        // Most entities pass trough here. Seems like entities that are not updated.
+                        let pvs_state = bitreader.read_nbits(2)? as u8;
+                        if let Some(Some(entity)) = self.entities.get_mut(entity_id as usize) {
+                            entity.pvs_state = Some(pvs_state);
+                        }
+                        if pvs_state & 0x01 == 1 {
+                            self.capture_utility_entity(entity_id, Some("dormant"));
+                            self.audit_lifecycle(entity_id, "dormant");
+                            self.world_entity_lifecycle(entity_id, true);
+                            // Odd PVS codes leave visibility/dormancy. Emit immediately: waiting
+                            // for the periodic weapon snapshot can miss a short leave/enter cycle.
+                            if self.prop_controller.capture_weapon_entities {
+                                let snapshot = self.entities.get(entity_id as usize)
+                                    .and_then(|entry| entry.as_ref())
+                                    .and_then(|entity| self.snapshot_weapon_entity(entity));
+                                if let Some(snapshot) = snapshot {
+                                    self.weapon_entity_snapshots.push(snapshot);
+                                }
+                            }
+                            continue;
+                        }
+                    } else if let Some(Some(entity)) = self.entities.get_mut(entity_id as usize) {
+                        // An ordinary entity update is authoritative evidence that it is back in
+                        // the visible PVS; do not retain a preceding leave code indefinitely.
+                        entity.pvs_state = Some(0);
+                    }
+                    self.update_entity(&mut bitreader, entity_id, false, &mut events_to_emit, is_fullpacket)?;
+                    let active_weapon_after = if self.prop_controller.capture_weapon_entities {
+                        self.active_weapon_entity(entity_id)
+                    } else {
+                        None
+                    };
+                    if active_weapon_before != active_weapon_after {
+                        for weapon_id in [active_weapon_before, active_weapon_after]
+                            .into_iter()
+                            .flatten()
+                        {
+                            let snapshot = self.entities.get(weapon_id as usize)
+                                .and_then(|entry| entry.as_ref())
+                                .and_then(|weapon| self.snapshot_weapon_entity(weapon));
+                            if let Some(snapshot) = snapshot {
+                                self.weapon_entity_snapshots.push(snapshot);
+                            }
+                        }
+                    }
+                    // Every authoritative weapon update can change ownership, inventory state,
+                    // ammo, cosmetics, or transform. Emit it immediately; the periodic full
+                    // inventory walk is now needed only once to seed the requested range.
+                    if self.prop_controller.capture_weapon_entities {
+                        let snapshot = self.entities.get(entity_id as usize)
+                            .and_then(|entry| entry.as_ref())
+                            .and_then(|entity| self.snapshot_weapon_entity(entity));
+                        if let Some(snapshot) = snapshot {
+                            self.weapon_entity_snapshots.push(snapshot);
+                        }
+                    }
+                }
+            }
+            if !matches!(cmd, EntityCmd::Delete) {
+                self.capture_utility_entity(entity_id, None);
             }
         }
         if !events_to_emit.is_empty() {
@@ -234,11 +336,11 @@ impl<'a> SecondPassParser<'a> {
         is_baseline: bool,
         events_to_emit: &mut Vec<GameEventInfo>,
     ) -> Result<usize, DemoParserError> {
-        let entity = match self.entities.get_mut(entity_id as usize) {
-            Some(Some(entity)) => entity,
+        let (cls_id, serial) = match self.entities.get(entity_id as usize) {
+            Some(Some(entity)) => (entity.cls_id, entity.serial),
             _ => return Err(DemoParserError::EntityNotFound),
         };
-        let class = match self.cls_by_id.get(entity.cls_id as usize) {
+        let class = match self.cls_by_id.get(cls_id as usize) {
             Some(cls) => cls,
             None => return Err(DemoParserError::ClassNotFound),
         };
@@ -248,6 +350,23 @@ impl<'a> SecondPassParser<'a> {
             let field_info = get_propinfo(&field, path);
             let decoder = get_decoder_from_field(field)?;
             let result = bitreader.decode(&decoder, self.qf_mapper)?;
+
+            self.smoke_voxels.observe(entity_id, &class.name, field, path, &result);
+            self.ag2_recipes.observe(entity_id, serial, &class.name, self.tick, field, path, &result);
+            self.infernos.observe(entity_id, field, path, &result);
+            self.utility.observe(entity_id, field, path, &result);
+            // A baseline is class default data and a full packet is a re-sent snapshot.
+            // Neither is evidence that anything moved; only a delta update is.
+            let is_delta_update = !is_baseline && !is_fullpacket;
+            self.world_entity_audit.observe(
+                entity_id, serial, &class.name, self.tick, field, &result, is_delta_update);
+            self.world_entities.observe(
+                entity_id, serial, &class.name, self.tick, field, &result, is_delta_update);
+
+            let entity = match self.entities.get_mut(entity_id as usize) {
+                Some(Some(entity)) => entity,
+                _ => return Err(DemoParserError::EntityNotFound),
+            };
 
             // listen_to_props()
             if self.list_props {
@@ -259,7 +378,16 @@ impl<'a> SecondPassParser<'a> {
             }
             // Custom events
             if !is_baseline {
-                SecondPassParser::listen_for_events(entity, &result, field, field_info, &self.prop_controller, &self.prop_controller.special_ids, is_fullpacket, events_to_emit);
+                SecondPassParser::listen_for_events(
+                    entity,
+                    &result,
+                    field,
+                    field_info,
+                    &self.prop_controller,
+                    &self.prop_controller.special_ids,
+                    is_fullpacket,
+                    events_to_emit,
+                );
             }
             // Debug
             if self.is_debug_mode {
@@ -272,7 +400,7 @@ impl<'a> SecondPassParser<'a> {
                     is_fullpacket,
                     is_baseline,
                     class,
-                    &entity.cls_id,
+                    &cls_id,
                     &entity_id,
                 );
             }
@@ -301,6 +429,28 @@ impl<'a> SecondPassParser<'a> {
     pub fn insert_field(entity: &mut Entity, result: Variant, field_info: Option<FieldInfo>) {
         if let Some(fi) = field_info {
             if fi.should_parse {
+                if (ECON_ATTRIBUTE_DEF_INDEX_BASE..ECON_ATTRIBUTE_DEF_INDEX_BASE + FLATTENED_VEC_MAX_LEN).contains(&fi.prop_id) {
+                    entity.props.insert(ECON_ATTRIBUTE_LEGACY_DEF_ID, result.clone());
+                    entity.props.insert(ECON_ATTRIBUTE_LEGACY_DEF_SLOT_ID,
+                        Variant::U32(fi.prop_id - ECON_ATTRIBUTE_DEF_INDEX_BASE));
+                }
+                if fi.prop_id == ECON_ATTRIBUTE_COUNT_ID {
+                    if let Variant::U32(count) = &result {
+                        // The legacy scalar is a diagnostic of the last decoded
+                        // live element, never permission to resurrect a removed one.
+                        if matches!(entity.props.get(&ECON_ATTRIBUTE_LEGACY_DEF_SLOT_ID), Some(Variant::U32(slot)) if slot >= count) {
+                            entity.props.remove(&ECON_ATTRIBUTE_LEGACY_DEF_ID);
+                            entity.props.remove(&ECON_ATTRIBUTE_LEGACY_DEF_SLOT_ID);
+                        }
+                        // Truncate storage as well as filtering reads: a later grow
+                        // must not resurrect attributes removed by an earlier shrink.
+                        entity.props.retain(|id, _| {
+                            [ECON_ATTRIBUTE_DEF_INDEX_BASE, ECON_ATTRIBUTE_RAW_VALUE_BASE]
+                                .iter().all(|base| !(*base..*base + FLATTENED_VEC_MAX_LEN).contains(id)
+                                    || *id - *base < *count)
+                        });
+                    }
+                }
                 entity.props.insert(fi.prop_id, result);
             }
         }
@@ -325,7 +475,7 @@ impl<'a> SecondPassParser<'a> {
         }
         Ok(())
     }
-    fn create_new_entity(&mut self, bitreader: &mut Bitreader, entity_id: &i32, _events_to_emit: &mut Vec<GameEventInfo>) -> Result<(), DemoParserError> {
+    fn create_new_entity(&mut self, bitreader: &mut Bitreader, entity_id: &i32, _events_to_emit: &mut Vec<GameEventInfo>, is_fullpacket: bool) -> Result<(), DemoParserError> {
         // Class id width is dynamic: ceil(log2(num_classes + 1)). Hardcoded 8 bits
         // capped at 256 classes and broke on patches with more (14154+), causing
         // bitstream desync and cascading EntityNotFound errors. cls_by_id.len()
@@ -333,9 +483,36 @@ impl<'a> SecondPassParser<'a> {
         let cls_bits = (self.cls_by_id.len() as f32).log2().ceil() as u32;
         let cls_id: u32 = bitreader.read_nbits(cls_bits)?;
         // Both of these are not used. Don't think they are interesting for the parser
-        let _serial = bitreader.read_nbits(NSERIALBITS)?;
+        let serial = bitreader.read_nbits(NSERIALBITS)?;
         let _unknown = bitreader.read_varint();
         let entity_type = self.check_entity_type(&cls_id)?;
+        if let Some(class) = self.cls_by_id.get(cls_id as usize) {
+            if self.utility.is_replaced(*entity_id, serial, &class.name) {
+                self.capture_utility_entity(*entity_id, Some("replaced"));
+            }
+        }
+        if let Some(class) = self.cls_by_id.get(cls_id as usize) {
+            self.utility.begin(*entity_id, serial, &class.name, is_fullpacket);
+            self.ag2_recipes.begin(*entity_id, serial, &class.name);
+            self.world_entity_audit.begin(*entity_id, serial, &class.name, self.tick);
+        self.world_entities.begin(*entity_id, serial, &class.name, self.tick);
+        }
+        let is_smoke = self
+            .cls_by_id
+            .get(cls_id as usize)
+            .map(|class| class.name.contains("SmokeGrenadeProjectile"))
+            .unwrap_or(false);
+        if is_smoke {
+            self.smoke_voxels.begin(*entity_id, self.tick);
+        } else {
+            self.smoke_voxels.finish_entity(*entity_id, self.tick);
+        }
+        if self.cls_by_id.get(cls_id as usize).map(|c| c.name == "CInferno").unwrap_or(false) {
+            self.infernos.begin(*entity_id, serial, self.tick);
+        } else {
+            self.infernos.remove(*entity_id, self.tick);
+        }
+        if entity_type != EntityType::Projectile { self.projectiles.remove(entity_id); }
         match entity_type {
             EntityType::Projectile => {
                 self.projectiles.insert(*entity_id);
@@ -347,8 +524,12 @@ impl<'a> SecondPassParser<'a> {
         let entity = Entity {
             entity_id: *entity_id,
             cls_id,
+            serial,
             props: AHashMap::with_capacity(0),
             entity_type,
+            // Creation makes the entity visible; subsequent odd transition codes mark it as
+            // outside PVS/dormant until an enter or ordinary update resets this to an even code.
+            pvs_state: Some(0),
         };
         if self.entities.len() as i32 <= *entity_id {
             // if corrupt, this can cause oom allocations
@@ -368,6 +549,44 @@ impl<'a> SecondPassParser<'a> {
             self.update_entity(&mut br, *entity_id, true, &mut vec![], false)?;
         }
         Ok(())
+    }
+
+    /// Ends a world entity's life in the capture lane. A `leave` code is dormancy, not a
+    /// removal; only the latter can mean a breakable was destroyed.
+    fn world_entity_lifecycle(&mut self, entity_id: i32, dormant: bool) {
+        if !self.world_entities.enabled() {
+            return;
+        }
+        let Some((cls_id, serial)) = self
+            .entities
+            .get(entity_id as usize)
+            .and_then(|entry| entry.as_ref())
+            .map(|entity| (entity.cls_id, entity.serial))
+        else {
+            return;
+        };
+        if let Some(class) = self.cls_by_id.get(cls_id as usize) {
+            self.world_entities.end(entity_id, serial, &class.name, self.tick, dormant);
+        }
+    }
+
+    /// Records a lifecycle transition for the discovery audit. A no-op unless the audit is
+    /// on, and deliberately reads the entity before the caller clears it.
+    fn audit_lifecycle(&mut self, entity_id: i32, transition: &'static str) {
+        if !self.world_entity_audit.enabled() {
+            return;
+        }
+        let Some((cls_id, serial)) = self
+            .entities
+            .get(entity_id as usize)
+            .and_then(|entry| entry.as_ref())
+            .map(|entity| (entity.cls_id, entity.serial))
+        else {
+            return;
+        };
+        if let Some(class) = self.cls_by_id.get(cls_id as usize) {
+            self.world_entity_audit.end(entity_id, serial, &class.name, self.tick, transition);
+        }
     }
 
     pub fn check_entity_type(&self, cls_id: &u32) -> Result<EntityType, DemoParserError> {

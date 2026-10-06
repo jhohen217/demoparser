@@ -15,6 +15,8 @@ pub enum Variant {
     F32(f32),
     U64(u64),
     String(String),
+    /// Opaque bytes decoded from Source 2's CUtlBinaryBlock fields.
+    Binary(Vec<u8>),
     VecXY([f32; 2]),
     VecXYZ([f32; 3]),
     // Todo change to Vec<T>
@@ -28,10 +30,14 @@ pub enum Variant {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Sticker {
     pub name: String,
-    pub wear: f32,
+    pub wear: Option<f32>,
     pub id: u32,
-    pub x: f32,
-    pub y: f32,
+    pub slot: u32,
+    pub scale: Option<f32>,
+    pub rotation: Option<f32>,
+    pub offset_x: Option<f32>,
+    pub offset_y: Option<f32>,
+    pub schema: Option<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InputHistory {
@@ -63,6 +69,7 @@ pub enum VarVec {
     F32(Vec<Option<f32>>),
     I32(Vec<Option<i32>>),
     String(Vec<Option<String>>),
+    Binary(Vec<Option<Vec<u8>>>),
     StringVec(Vec<Vec<String>>),
     U64Vec(Vec<Vec<u64>>),
     U32Vec(Vec<Vec<u32>>),
@@ -80,6 +87,7 @@ impl VarVec {
             Variant::I32(_) => VarVec::I32(vec![]),
             Variant::F32(_) => VarVec::F32(vec![]),
             Variant::String(_) => VarVec::String(vec![]),
+            Variant::Binary(_) => VarVec::Binary(vec![]),
             Variant::U64(_) => VarVec::U64(vec![]),
             Variant::U32(_) => VarVec::U32(vec![]),
             Variant::StringVec(_) => VarVec::StringVec(vec![]),
@@ -110,6 +118,7 @@ impl PropColumn {
             Some(VarVec::I32(b)) => VarVec::I32(indicies.iter().map(|x| b[*x]).collect_vec()),
             Some(VarVec::F32(b)) => VarVec::F32(indicies.iter().map(|x| b[*x]).collect_vec()),
             Some(VarVec::String(b)) => VarVec::String(indicies.iter().map(|x| b[*x].to_owned()).collect_vec()),
+            Some(VarVec::Binary(b)) => VarVec::Binary(indicies.iter().map(|x| b[*x].to_owned()).collect_vec()),
             Some(VarVec::U32(b)) => VarVec::U32(indicies.iter().map(|x| b[*x]).collect_vec()),
             Some(VarVec::U64(b)) => VarVec::U64(indicies.iter().map(|x| b[*x]).collect_vec()),
             Some(VarVec::StringVec(b)) => VarVec::StringVec(indicies.iter().map(|x| b[*x].to_owned()).collect_vec()),
@@ -138,6 +147,7 @@ impl PropColumn {
             Some(VarVec::I32(b)) => b.len(),
             Some(VarVec::F32(b)) => b.len(),
             Some(VarVec::String(b)) => b.len(),
+            Some(VarVec::Binary(b)) => b.len(),
             Some(VarVec::U32(b)) => b.len(),
             Some(VarVec::U64(b)) => b.len(),
             Some(VarVec::StringVec(b)) => b.len(),
@@ -285,6 +295,11 @@ impl PropColumn {
                 }
                 _ => {}
             },
+            Some(VarVec::Binary(v)) => match &other.data {
+                Some(VarVec::Binary(v_other)) => v.extend_from_slice(v_other),
+                None => for _ in 0..other.num_nones { v.push(None); },
+                _ => {}
+            },
             Some(VarVec::UserCmdSubtickMoves(v)) => match &other.data {
                 Some(VarVec::UserCmdSubtickMoves(v_other)) => {
                     v.extend_from_slice(&v_other);
@@ -360,6 +375,10 @@ impl PropColumn {
                     self.resolve_vec_type(PropColumn::get_type(&other.data));
                     self.extend_from(other);
                 }
+                Some(VarVec::Binary(_inner)) => {
+                    self.resolve_vec_type(PropColumn::get_type(&other.data));
+                    self.extend_from(other);
+                }
                 Some(VarVec::UserCmdSubtickMoves(_inner)) => {
                     self.resolve_vec_type(PropColumn::get_type(&other.data));
                     self.extend_from(other);
@@ -387,6 +406,7 @@ impl PropColumn {
             Some(VarVec::U32Vec(_)) => Some(11),
             Some(VarVec::InputHistory(_)) => Some(12),
             Some(VarVec::UserCmdSubtickMoves(_)) => Some(13),
+            Some(VarVec::Binary(_)) => Some(14),
 
             None => None,
         }
@@ -410,6 +430,7 @@ impl PropColumn {
             Some(11) => self.data = Some(VarVec::U32Vec(vec![])),
             Some(12) => self.data = Some(VarVec::InputHistory(vec![])),
             Some(13) => self.data = Some(VarVec::UserCmdSubtickMoves(vec![])),
+            Some(14) => self.data = Some(VarVec::Binary(vec![])),
             _ => {}
         }
         for _ in 0..self.num_nones {
@@ -492,6 +513,10 @@ impl VarVec {
                 VarVec::InputHistory(f) => f.push(p),
                 _ => {}
             },
+            Some(Variant::Binary(p)) => match self {
+                VarVec::Binary(f) => f.push(Some(p)),
+                _ => {}
+            },
             Some(Variant::UserCmdSubtickMoves(p)) => match self {
                 VarVec::UserCmdSubtickMoves(f) => f.push(p),
                 _ => {}
@@ -504,6 +529,7 @@ impl VarVec {
             VarVec::I32(f) => f.push(None),
             VarVec::F32(f) => f.push(None),
             VarVec::String(f) => f.push(None),
+            VarVec::Binary(f) => f.push(None),
             VarVec::U32(f) => f.push(None),
             VarVec::U64(f) => f.push(None),
             VarVec::Bool(f) => f.push(None),
@@ -533,6 +559,7 @@ impl Serialize for Variant {
             Variant::F32(f) => serializer.serialize_f32(*f),
             Variant::I32(i) => serializer.serialize_i32(*i),
             Variant::String(s) => serializer.serialize_str(s),
+            Variant::Binary(bytes) => serializer.serialize_bytes(bytes),
             Variant::U32(u) => serializer.serialize_u32(*u),
             Variant::U64(u) => serializer.serialize_str(&u.to_string()),
             Variant::StringVec(v) => {
@@ -758,6 +785,10 @@ pub fn soa_to_aos(soa: OutputSerdeHelperStruct) -> Vec<std::collections::HashMap
                         Some(f) => hm.insert(prop_info.prop_friendly_name.clone(), Some(Variant::InputHistory(f.clone()))),
                         _ => hm.insert(prop_info.prop_friendly_name.clone(), None),
                     },
+                    Some(VarVec::Binary(val)) => match val.get(idx) {
+                        Some(Some(bytes)) => hm.insert(prop_info.prop_friendly_name.clone(), Some(Variant::Binary(bytes.clone()))),
+                        _ => hm.insert(prop_info.prop_friendly_name.clone(), None),
+                    },
                     Some(VarVec::UserCmdSubtickMoves(val)) => match val.get(idx) {
                         Some(f) => hm.insert(prop_info.prop_friendly_name.clone(), Some(Variant::UserCmdSubtickMoves(f.clone()))),
                         _ => hm.insert(prop_info.prop_friendly_name.clone(), None),
@@ -788,6 +819,9 @@ impl Serialize for OutputSerdeHelperStruct {
                         map.serialize_entry(&prop_info.prop_friendly_name, val)?;
                     }
                     Some(VarVec::String(val)) => {
+                        map.serialize_entry(&prop_info.prop_friendly_name, val)?;
+                    }
+                    Some(VarVec::Binary(val)) => {
                         map.serialize_entry(&prop_info.prop_friendly_name, val)?;
                     }
                     Some(VarVec::U64(val)) => {

@@ -725,6 +725,7 @@ pub fn _create_tests() {
     custom.insert(STEAMID_ID, "steamid");
     custom.insert(NAME_ID, "name");
     custom.insert(WEAPON_STICKERS_ID, "weapon_stickers");
+    custom.insert(WEAPON_KEYCHAIN_ID, "weapon_keychain");
     custom.insert(IS_AIRBORNE_ID, "is_airborne");
 
     for (k, v) in d.df {
@@ -2241,70 +2242,36 @@ mod tests {
     }
     #[test]
     fn weapon_stickers() {
-        let prop = (
-            "weapon_stickers",
-            PropColumn {
-                data: Some(Stickers(vec![
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![Sticker {
-                        name: "eslcologne2015_signature_taz_foil".to_string(),
-                        wear: 0.0,
-                        id: 477,
-                        x: 6.711e-42,
-                        y: 6.711e-42,
-                    }],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![Sticker {
-                        name: "eslcologne2015_signature_taz_gold".to_string(),
-                        wear: 0.0,
-                        id: 478,
-                        x: 6.711e-42,
-                        y: 6.711e-42,
-                    }],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                    vec![],
-                ])),
-                num_nones: 0,
-            },
-        );
-        assert_eq!(out.0.df[&WEAPON_STICKERS_ID], prop.1);
+        // Independent packet decoding, test_demo.dem SHA256
+        // 84a1a4191302bdd2a3bbb5a727842093744b1fb1a228aeec630369e44b622cb2:
+        // SSG08 entity 403 creation tick 16545: attributes 113/117/121/125
+        // all carry raw bits 4789. M4A4 entity 405 tick 16619: 121 -> 4541.
+        // Deagle entity 289 tick 27452: 113/117/121 -> 5263/5436/5449.
+        // No wear/scale/rotation attributes are present for these stickers.
+        // 6.711e-42 is from_bits(4789), not a recorded scale or rotation.
+        fn sticker(id: u32, slot: u32, name: &str) -> Sticker {
+            Sticker { name: name.to_owned(), id, slot, wear: None,
+                scale: None, rotation: None, offset_x: None, offset_y: None, schema: None }
+        }
+        let mut expected = vec![vec![]; 40];
+        expected[15] = vec![sticker(4541, 2, "halo_noble")];
+        expected[19] = (0..4).map(|slot| sticker(4789, slot, "rmr2020_team_ren")).collect();
+        expected[21] = vec![
+            sticker(5263, 0, "spring2022_phx_balaclava_holo"),
+            sticker(5436, 1, "antwerp2022_signature_tabsen_2"),
+            sticker(5449, 2, "antwerp2022_signature_krimbo_2_glitter"),
+        ];
+        expected[29] = expected[19].clone();
+        assert_eq!(out.0.df[&WEAPON_STICKERS_ID],
+            PropColumn { data: Some(Stickers(expected)), num_nones: 0 });
     }
     #[test]
     fn weapon_float() {
+        // test_demo.dem (SHA256 84a1a4191302bdd2a3bbb5a727842093744b1fb1a228aeec630369e44b622cb2):
+        // MAC-10 entities 100/222 are created at ticks 15839/15902 with
+        // wire econ-vector path [86] length 0, replacing the six-entry
+        // Monkeyflage baseline. Rows 13/17 must not inherit its paint/seed/wear.
+        // Independently decoded by S2DVR scripts/stickers/econ_vector_probe.rs --state-at 20000.
         let prop = (
             "weapon_float",
             PropColumn {
@@ -2322,11 +2289,11 @@ mod tests {
                     Some(0.43085524),
                     Some(0.6917364),
                     None,
-                    Some(0.7812842),
+                    None,
                     None,
                     Some(0.25730723),
                     None,
-                    Some(0.7812842),
+                    None,
                     None,
                     Some(0.6907767),
                     Some(0.43085524),
@@ -2375,11 +2342,11 @@ mod tests {
                     Some(762),
                     Some(804),
                     Some(0),
-                    Some(760),
+                    Some(0),
                     Some(0),
                     Some(16),
                     Some(0),
-                    Some(760),
+                    Some(0),
                     Some(0),
                     Some(711),
                     Some(762),
@@ -3161,8 +3128,137 @@ mod tests {
     fn inventory() {
         let prop = (
             "inventory",
-            PropColumn { data: Some(StringVec(vec![vec!["knife_t".to_string(), "Desert Eagle".to_string(), "Smoke Grenade".to_string(), "Flashbang".to_string(), "Flashbang".to_string()], vec!["Bowie Knife".to_string(), "USP-S".to_string()], vec!["knife_t".to_string(), "Desert Eagle".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string(), "High Explosive Grenade".to_string()], vec!["knife".to_string(), "USP-S".to_string()], vec!["knife".to_string(), "P2000".to_string()], vec!["M9 Bayonet".to_string(), "USP-S".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "C4 Explosive".to_string(), "AK-47".to_string(), "Smoke Grenade".to_string()], vec!["knife".to_string(), "USP-S".to_string()], vec!["knife_t".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string(), "Flashbang".to_string(), "Flashbang".to_string()], vec!["Bowie Knife".to_string(), "USP-S".to_string(), "M4A4".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "MAC-10".to_string()], vec![], vec!["knife".to_string(), "P2000".to_string(), "M4A4".to_string()], vec!["M9 Bayonet".to_string(), "USP-S".to_string(), "AK-47".to_string(), "Smoke Grenade".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "MAC-10".to_string(), "Smoke Grenade".to_string(), "Flashbang".to_string(), "Flashbang".to_string(), "C4 Explosive".to_string()], vec!["knife".to_string(), "USP-S".to_string(), "FAMAS".to_string()], vec!["Huntsman Knife".to_string(), "Glock-18".to_string(), "SSG 08".to_string(), "Flashbang".to_string()], vec!["knife_t".to_string(), "AK-47".to_string(), "Desert Eagle".to_string()], vec!["Bowie Knife".to_string(), "Desert Eagle".to_string()], vec![], vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string()], vec!["knife".to_string(), "USP-S".to_string(), "M4A1-S".to_string()], vec![], vec!["M9 Bayonet".to_string(), "USP-S".to_string(), "M4A1-S".to_string(), "Flashbang".to_string(), "Flashbang".to_string()], vec![], vec!["knife".to_string(), "P250".to_string()], vec!["Huntsman Knife".to_string(), "SSG 08".to_string(), "P250".to_string(), "Smoke Grenade".to_string(), "Flashbang".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string(), "Smoke Grenade".to_string(), "Molotov".to_string(), "Flashbang".to_string(), "Flashbang".to_string()], vec!["Bowie Knife".to_string(), "USP-S".to_string(), "M4A1-S".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string(), "Molotov".to_string(), "High Explosive Grenade".to_string(), "Smoke Grenade".to_string(), "Flashbang".to_string()], vec!["knife".to_string(), "USP-S".to_string()], vec!["knife".to_string(), "P2000".to_string(), "Smoke Grenade".to_string(), "High Explosive Grenade".to_string(), "Incendiary Grenade".to_string()], vec!["M9 Bayonet".to_string(), "USP-S".to_string()], vec!["knife_t".to_string(), "Glock-18".to_string(), "C4 Explosive".to_string(), "AWP".to_string(), "Smoke Grenade".to_string(), "Molotov".to_string(), "High Explosive Grenade".to_string()], vec!["knife".to_string(), "USP-S".to_string()], vec!["Huntsman Knife".to_string(), "AK-47".to_string(), "R8 Revolver".to_string(), "High Explosive Grenade".to_string(), "Molotov".to_string(), "Smoke Grenade".to_string(), "Flashbang".to_string()]])), num_nones: 0 
-            }
+            PropColumn {
+                data: Some(StringVec(vec![
+                    vec![
+                        "knife_t".to_string(),
+                        "Desert Eagle".to_string(),
+                        "Smoke Grenade".to_string(),
+                        "Flashbang".to_string(),
+                        "Flashbang".to_string(),
+                    ],
+                    vec!["Bowie Knife".to_string(), "USP-S".to_string()],
+                    vec!["knife_t".to_string(), "Desert Eagle".to_string()],
+                    vec![
+                        "knife_t".to_string(),
+                        "Glock-18".to_string(),
+                        "AK-47".to_string(),
+                        "High Explosive Grenade".to_string(),
+                    ],
+                    vec!["knife".to_string(), "USP-S".to_string()],
+                    vec!["knife".to_string(), "P2000".to_string()],
+                    vec!["M9 Bayonet".to_string(), "USP-S".to_string()],
+                    vec![
+                        "knife_t".to_string(),
+                        "Glock-18".to_string(),
+                        "C4 Explosive".to_string(),
+                        "AK-47".to_string(),
+                        "Smoke Grenade".to_string(),
+                    ],
+                    vec!["knife".to_string(), "USP-S".to_string()],
+                    vec!["knife_t".to_string()],
+                    vec![
+                        "knife_t".to_string(),
+                        "Glock-18".to_string(),
+                        "AK-47".to_string(),
+                        "Flashbang".to_string(),
+                        "Flashbang".to_string(),
+                    ],
+                    vec!["Bowie Knife".to_string(), "USP-S".to_string(), "M4A4".to_string()],
+                    vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string()],
+                    vec!["knife_t".to_string(), "Glock-18".to_string(), "MAC-10".to_string()],
+                    vec![],
+                    vec!["knife".to_string(), "P2000".to_string(), "M4A4".to_string()],
+                    vec!["M9 Bayonet".to_string(), "USP-S".to_string(), "AK-47".to_string(), "Smoke Grenade".to_string()],
+                    vec![
+                        "knife_t".to_string(),
+                        "Glock-18".to_string(),
+                        "MAC-10".to_string(),
+                        "Smoke Grenade".to_string(),
+                        "Flashbang".to_string(),
+                        "Flashbang".to_string(),
+                        "C4 Explosive".to_string(),
+                    ],
+                    vec!["knife".to_string(), "USP-S".to_string(), "FAMAS".to_string()],
+                    vec![
+                        "Huntsman Knife".to_string(),
+                        "Glock-18".to_string(),
+                        "SSG 08".to_string(),
+                        "Flashbang".to_string(),
+                    ],
+                    vec!["knife_t".to_string(), "AK-47".to_string(), "Desert Eagle".to_string()],
+                    vec!["Bowie Knife".to_string(), "Desert Eagle".to_string()],
+                    vec![],
+                    vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string()],
+                    vec!["knife".to_string(), "USP-S".to_string(), "M4A1-S".to_string()],
+                    vec![],
+                    vec![
+                        "M9 Bayonet".to_string(),
+                        "USP-S".to_string(),
+                        "M4A1-S".to_string(),
+                        "Flashbang".to_string(),
+                        "Flashbang".to_string(),
+                    ],
+                    vec![],
+                    vec!["knife".to_string(), "P250".to_string()],
+                    vec![
+                        "Huntsman Knife".to_string(),
+                        "SSG 08".to_string(),
+                        "P250".to_string(),
+                        "Smoke Grenade".to_string(),
+                        "Flashbang".to_string(),
+                    ],
+                    vec![
+                        "knife_t".to_string(),
+                        "Glock-18".to_string(),
+                        "AK-47".to_string(),
+                        "Smoke Grenade".to_string(),
+                        "Molotov".to_string(),
+                        "Flashbang".to_string(),
+                        "Flashbang".to_string(),
+                    ],
+                    vec!["Bowie Knife".to_string(), "USP-S".to_string(), "M4A1-S".to_string()],
+                    vec!["knife_t".to_string(), "Glock-18".to_string(), "AK-47".to_string()],
+                    vec![
+                        "knife_t".to_string(),
+                        "Glock-18".to_string(),
+                        "AK-47".to_string(),
+                        "Molotov".to_string(),
+                        "High Explosive Grenade".to_string(),
+                        "Smoke Grenade".to_string(),
+                        "Flashbang".to_string(),
+                    ],
+                    vec!["knife".to_string(), "USP-S".to_string()],
+                    vec![
+                        "knife".to_string(),
+                        "P2000".to_string(),
+                        "Smoke Grenade".to_string(),
+                        "High Explosive Grenade".to_string(),
+                        "Incendiary Grenade".to_string(),
+                    ],
+                    vec!["M9 Bayonet".to_string(), "USP-S".to_string()],
+                    vec![
+                        "knife_t".to_string(),
+                        "Glock-18".to_string(),
+                        "C4 Explosive".to_string(),
+                        "AWP".to_string(),
+                        "Smoke Grenade".to_string(),
+                        "Molotov".to_string(),
+                        "High Explosive Grenade".to_string(),
+                    ],
+                    vec!["knife".to_string(), "USP-S".to_string()],
+                    vec![
+                        "Huntsman Knife".to_string(),
+                        "AK-47".to_string(),
+                        "R8 Revolver".to_string(),
+                        "High Explosive Grenade".to_string(),
+                        "Molotov".to_string(),
+                        "Smoke Grenade".to_string(),
+                        "Flashbang".to_string(),
+                    ],
+                ])),
+                num_nones: 0,
+            },
         );
         assert_eq!(out.0.df[&INVENTORY_ID], prop.1);
     }
@@ -3170,7 +3266,51 @@ mod tests {
     fn inventory_as_ids() {
         let prop = (
             "inventory_as_ids",
-            PropColumn { data: Some(U32Vec(vec![vec![59, 1, 45, 43, 43], vec![514, 61], vec![59, 1], vec![59, 4, 7, 44], vec![42, 61], vec![42, 32], vec![508, 61], vec![59, 4, 49, 7, 45], vec![42, 61], vec![59], vec![59, 4, 7, 43, 43], vec![514, 61, 16], vec![59, 4, 7], vec![59, 4, 17], vec![], vec![42, 32, 16], vec![508, 61, 7, 45], vec![59, 4, 17, 45, 43, 43, 49], vec![42, 61, 10], vec![509, 4, 40, 43], vec![59, 7, 1], vec![514, 1], vec![], vec![59, 4, 7], vec![42, 61, 60], vec![], vec![508, 61, 60, 43, 43], vec![], vec![42, 36], vec![509, 40, 36, 45, 43], vec![59, 4, 7, 45, 46, 43, 43], vec![514, 61, 60], vec![59, 4, 7], vec![59, 4, 7, 46, 44, 45, 43], vec![42, 61], vec![42, 32, 45, 44, 48], vec![508, 61], vec![59, 4, 49, 9, 45, 46, 44], vec![42, 61], vec![509, 7, 64, 44, 46, 45, 43]])), num_nones: 0 },
+            PropColumn {
+                data: Some(U32Vec(vec![
+                    vec![59, 1, 45, 43, 43],
+                    vec![514, 61],
+                    vec![59, 1],
+                    vec![59, 4, 7, 44],
+                    vec![42, 61],
+                    vec![42, 32],
+                    vec![508, 61],
+                    vec![59, 4, 49, 7, 45],
+                    vec![42, 61],
+                    vec![59],
+                    vec![59, 4, 7, 43, 43],
+                    vec![514, 61, 16],
+                    vec![59, 4, 7],
+                    vec![59, 4, 17],
+                    vec![],
+                    vec![42, 32, 16],
+                    vec![508, 61, 7, 45],
+                    vec![59, 4, 17, 45, 43, 43, 49],
+                    vec![42, 61, 10],
+                    vec![509, 4, 40, 43],
+                    vec![59, 7, 1],
+                    vec![514, 1],
+                    vec![],
+                    vec![59, 4, 7],
+                    vec![42, 61, 60],
+                    vec![],
+                    vec![508, 61, 60, 43, 43],
+                    vec![],
+                    vec![42, 36],
+                    vec![509, 40, 36, 45, 43],
+                    vec![59, 4, 7, 45, 46, 43, 43],
+                    vec![514, 61, 60],
+                    vec![59, 4, 7],
+                    vec![59, 4, 7, 46, 44, 45, 43],
+                    vec![42, 61],
+                    vec![42, 32, 45, 44, 48],
+                    vec![508, 61],
+                    vec![59, 4, 49, 9, 45, 46, 44],
+                    vec![42, 61],
+                    vec![509, 7, 64, 44, 46, 45, 43],
+                ])),
+                num_nones: 0,
+            },
         );
         assert_eq!(out.0.df[&INVENTORY_AS_IDS_ID], prop.1);
     }
@@ -5751,11 +5891,11 @@ mod tests {
                     Some("Head Shot".to_string()),
                     Some("The Emperor".to_string()),
                     None,
-                    Some("Monkeyflage".to_string()),
+                    None,
                     None,
                     Some("Magnesium".to_string()),
                     None,
-                    Some("Monkeyflage".to_string()),
+                    None,
                     None,
                     Some("Necropos".to_string()),
                     Some("Head Shot".to_string()),
@@ -5803,11 +5943,11 @@ mod tests {
                     Some(1221),
                     Some(844),
                     None,
-                    Some(1150),
+                    None,
                     None,
                     Some(811),
                     None,
-                    Some(1150),
+                    None,
                     None,
                     Some(538),
                     Some(1221),
@@ -15058,6 +15198,9 @@ mod tests {
     }
     #[test]
     fn CEconItemAttribute_m_iAttributeDefinitionIndex() {
+        // Compatibility diagnostic: most recently decoded live definition,
+        // not an item identity or a substitute for the complete attribute list.
+        // The two MAC-10s at tick 20000 clear their baseline vector (see weapon_float).
         let prop = (
             "CEconItemAttribute.m_iAttributeDefinitionIndex",
             PropColumn {
@@ -15075,11 +15218,11 @@ mod tests {
                     Some(8),
                     Some(75),
                     None,
-                    Some(81),
+                    None,
                     None,
                     Some(121),
                     None,
-                    Some(81),
+                    None,
                     None,
                     Some(125),
                     Some(8),

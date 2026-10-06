@@ -2,9 +2,11 @@ use crate::entity_handle::{entity_handle_index, INVALID_ENTITY_ID};
 use crate::first_pass::prop_controller::PLAYER_ENTITY_HANDLE_MISSING;
 use crate::first_pass::prop_controller::PropController;
 use crate::first_pass::prop_controller::PropInfo;
+use crate::first_pass::prop_controller::FLATTENED_VEC_MAX_LEN;
 use crate::first_pass::prop_controller::ITEM_PURCHASE_COST;
 use crate::first_pass::prop_controller::ITEM_PURCHASE_COUNT;
 use crate::first_pass::prop_controller::ITEM_PURCHASE_DEF_IDX;
+use crate::first_pass::prop_controller::ITEM_PURCHASE_HANDLE;
 use crate::first_pass::prop_controller::ITEM_PURCHASE_NEW_DEF_IDX;
 use crate::first_pass::prop_controller::SPECTATOR_TEAM_NUM;
 use crate::first_pass::prop_controller::WEAPON_FLOAT;
@@ -18,14 +20,15 @@ use crate::maps::ROUND_WIN_REASON;
 use crate::maps::ROUND_WIN_REASON_TO_WINNER;
 use crate::second_pass::collect_data::PropType;
 use crate::second_pass::entities::Entity;
+use crate::second_pass::entities::EntityType;
 use crate::second_pass::entities::PlayerMetaData;
 use crate::second_pass::parser_settings::SecondPassParser;
 use crate::second_pass::parser_settings::SpecialIDs;
 use crate::second_pass::variants::*;
-use csgoproto::CMsgPlayerBulletHit;
-use csgoproto::CMsgTeFireBullets;
 use csgoproto::csvc_msg_game_event::KeyT;
 use csgoproto::maps::WEAPINDICIES;
+use csgoproto::CMsgPlayerBulletHit;
+use csgoproto::CMsgTeFireBullets;
 use csgoproto::CUserMessageSayText;
 use csgoproto::CUserMessageSayText2;
 use csgoproto::CcsUsrMsgServerRankUpdate;
@@ -35,10 +38,6 @@ use itertools::Itertools;
 use prost::Message;
 use serde::ser::SerializeMap;
 use serde::Serialize;
-use crate::second_pass::entities::EntityType;
-use crate::first_pass::prop_controller::FLATTENED_VEC_MAX_LEN;
-use crate::first_pass::prop_controller::ITEM_PURCHASE_HANDLE;
-
 
 static INTERNALEVENTFIELDS: &'static [&str] = &[
     "userid",
@@ -70,7 +69,7 @@ pub enum GameEventInfo {
     WeaponCreateDefIdx((Variant, i32, u32)),
     WeaponPurchaseCount((Variant, i32, u32)),
     WeaponCreateDefIdxNew((Variant, i32, u32)),
-    PlayerConnect(i32)
+    PlayerConnect(i32),
 }
 
 static ENTITIES_FIRST_EVENTS: &'static [&str] = &["inferno_startburn", "decoy_started", "inferno_expire"];
@@ -140,7 +139,7 @@ fn decode_game_event(bytes: &[u8]) -> Result<CsvcMsgGameEvent, DemoParserError> 
 
 impl<'a> SecondPassParser<'a> {
     pub fn parse_event(&mut self, bytes: &[u8]) -> Result<Option<GameEvent>, DemoParserError> {
-        if self.wanted_events.len() == 0 && self.wanted_events.first() != Some(&"all".to_string()) {
+        if self.wanted_events.is_empty() && !self.utility.enabled {
             return Ok(None);
         }
 
@@ -156,13 +155,21 @@ impl<'a> SecondPassParser<'a> {
             self.game_events_counter.insert(event_name.to_owned());
         }
         // Return early if this is not a wanted event.
-        if !self.wanted_events.contains(&event_desc.name().to_string()) && self.wanted_events.first() != Some(&"all".to_string()) {
+        let wanted = self.wanted_events.contains(&event_desc.name().to_string()) || self.wanted_events.first() == Some(&"all".to_string());
+        let capture_utility = self.utility.enabled && super::utility::utility_event(event_desc.name());
+        if !wanted && !capture_utility {
             return Ok(None);
         }
         if REMOVEDEVENTS.contains(&event_desc.name()) {
             return Ok(None);
         }
         let mut event_fields: Vec<EventField> = vec![];
+
+        // A mismatched descriptor must fail the parse, not panic or silently
+        // discard utility keys and subsequently declare the source complete.
+        if event.keys.len() > event_desc.keys.len() {
+            return Err(DemoParserError::MalformedMessage);
+        }
 
         // Parsing game events is this easy, the complexity comes from adding "extra" fields into events.
         for i in 0..event.keys.len() {
@@ -176,6 +183,14 @@ impl<'a> SecondPassParser<'a> {
                 data: val,
             });
         }
+        if capture_utility {
+            self.utility.event(self.tick, self.current_demo_frame_offset,
+                self.current_network_message_index, event_desc.name(),
+                event_fields.iter().map(|f| super::utility::UtilityField {
+                    name: f.name.clone(), path: vec![], value: f.data.as_ref().map(Into::into),
+                }).collect());
+        }
+        if !wanted { return Ok(None); }
         if ENTITIES_FIRST_EVENTS.contains(&event_desc.name()) {
             let event = GameEvent {
                 fields: event_fields,
@@ -298,6 +313,16 @@ impl<'a> SecondPassParser<'a> {
                 _ => continue,
             };
             if let Some(Variant::I32(u)) = field.data {
+                // Preserve the event's userid and the live controller-to-pawn handle bridge
+                // before stripping internal event fields. The ordinary player metadata path
+                // reduces m_hPlayerPawn to an entity index; these additive diagnostic fields
+                // retain the full serial-bearing handle for offline identity audits.
+                if field.name == "userid" {
+                    extra_fields.push(EventField {
+                        name: format!("{prefix}_event_userid"),
+                        data: Some(Variant::I32(u)),
+                    });
+                }
                 let entity_id = match field.name.as_str() {
                     "entityid" => self.grenade_owner_entid_from_grenade(&field.data),
                     "userid_pawn" => self.entity_id_from_user_pawn(u),
@@ -308,18 +333,70 @@ impl<'a> SecondPassParser<'a> {
                     None => {
                         // player could not be found --> add None to output
                         extra_fields.extend(self.generate_empty_fields(prefix));
+                        extra_fields.extend(self.network_player_identity_fields(None, prefix));
                         continue;
                     }
                 };
                 extra_fields.push(self.create_player_name_field(entity_id, prefix));
                 extra_fields.push(self.create_player_steamid_field(entity_id, prefix));
                 extra_fields.extend(self.find_extra_props_events(entity_id, prefix));
+                extra_fields.extend(self.network_player_identity_fields(Some(entity_id), prefix));
             }
         }
         // Values from Teams and Rules entity. Not bound to any player so can be added to any event.
         extra_fields.extend(self.find_non_player_props());
         Ok(extra_fields)
     }
+
+    fn network_player_identity_fields(
+        &self,
+        player_entity_id: Option<i32>,
+        prefix: &str,
+    ) -> Vec<EventField> {
+        let metadata = player_entity_id.and_then(|entity_id| self.players.get(&entity_id));
+        let controller_entity_id = metadata.and_then(|player| player.controller_entid);
+        let pawn_handle = controller_entity_id.and_then(|controller_id| {
+            let prop_id = self.prop_controller.special_ids.player_pawn?;
+            match self.get_prop_from_ent(&prop_id, &controller_id) {
+                Ok(Variant::U32(handle)) => Some(handle),
+                _ => None,
+            }
+        });
+        let pawn_serial = player_entity_id
+            .and_then(|entity_id| usize::try_from(entity_id).ok())
+            .and_then(|index| self.entities.get(index))
+            .and_then(|entity| entity.as_ref())
+            .map(|entity| entity.serial);
+        let controller_serial = controller_entity_id
+            .and_then(|entity_id| usize::try_from(entity_id).ok())
+            .and_then(|index| self.entities.get(index))
+            .and_then(|entity| entity.as_ref())
+            .map(|entity| entity.serial);
+
+        vec![
+            EventField {
+                name: format!("{prefix}_network_pawn_handle"),
+                data: pawn_handle.map(Variant::U32),
+            },
+            EventField {
+                name: format!("{prefix}_network_pawn_entity_index"),
+                data: player_entity_id.map(Variant::I32),
+            },
+            EventField {
+                name: format!("{prefix}_network_pawn_entity_serial"),
+                data: pawn_serial.map(Variant::U32),
+            },
+            EventField {
+                name: format!("{prefix}_network_controller_entity_index"),
+                data: controller_entity_id.map(Variant::I32),
+            },
+            EventField {
+                name: format!("{prefix}_network_controller_entity_serial"),
+                data: controller_serial.map(Variant::U32),
+            },
+        ]
+    }
+
     pub fn entity_id_from_user_pawn(&self, pawn_handle: i32) -> Option<i32> {
         Some(entity_handle_index(pawn_handle as u32))
     }
@@ -655,17 +732,16 @@ impl<'a> SecondPassParser<'a> {
                             steamid,
                             controller_entid: Some(*entity_id),
                         };
-                        if self.players.iter().all(|x| x.1.steamid != steamid){
+                        if self.players.iter().all(|x| x.1.steamid != steamid) {
                             self.create_custom_event_player_connect(&p)?;
                         }
-                        self.players.insert(e,p.clone());
+                        self.players.insert(e, p.clone());
                     }
                 }
             }
         }
         Ok(())
     }
-
 
     fn create_custom_event_weapon_sold(&mut self, events: &[GameEventInfo]) {
         // This event is always emitted and is always removed in the end.
@@ -814,81 +890,81 @@ impl<'a> SecondPassParser<'a> {
         for purchase in purchases {
             let mut fields = vec![];
             //if let Some(buy_zone_id) = self.prop_controller.special_ids.in_buy_zone {
-                // if let Ok(Variant::Bool(true)) = self.get_prop_from_ent(&buy_zone_id, &purchase.entid) {
-                    if let Ok(player) = self.find_player_metadata(purchase.entid) {
-                        match purchase.name {
-                            Some(name) => {
-                                fields.push(EventField {
-                                    data: Some(Variant::String(name)),
-                                    name: "item_name".to_string(),
-                                });
-                            }
-                            None => {
-                                fields.push(EventField {
-                                    data: None,
-                                    name: "item_name".to_string(),
-                                });
-                            }
-                        }
+            // if let Ok(Variant::Bool(true)) = self.get_prop_from_ent(&buy_zone_id, &purchase.entid) {
+            if let Ok(player) = self.find_player_metadata(purchase.entid) {
+                match purchase.name {
+                    Some(name) => {
                         fields.push(EventField {
-                            data: self.create_name(player).ok(),
-                            name: "name".to_string(),
+                            data: Some(Variant::String(name)),
+                            name: "item_name".to_string(),
                         });
-                        fields.push(EventField {
-                            data: Some(Variant::U64(player.steamid.unwrap_or(0))),
-                            name: "steamid".to_string(),
-                        });
-                        fields.push(EventField {
-                            data: Some(Variant::U32(purchase.inventory_slot)),
-                            name: "inventory_slot".to_string(),
-                        });
-                        fields.push(EventField {
-                            data: Some(Variant::I32(purchase.cost)),
-                            name: "cost".to_string(),
-                        });
-                        fields.push(EventField {
-                            data: Some(Variant::I32(self.tick)),
-                            name: "tick".to_string(),
-                        });
-                        fields.push(EventField {
-                            data: self.get_prop_from_ent(&WEAPON_FLOAT, &purchase.weapon_entid).ok(),
-                            name: "float".to_string(),
-                        });
-                        fields.push(EventField {
-                            data: self.find_weapon_skin(&purchase.weapon_entid).ok(),
-                            name: "skin".to_string(),
-                        });
-                        fields.push(EventField {
-                            data: self.find_weapon_skin_id(&purchase.weapon_entid).ok(),
-                            name: "skin_id".to_string(),
-                        });
-                        fields.push(EventField {
-                            data: self.get_prop_from_ent(&WEAPON_PAINT_SEED, &purchase.weapon_entid).ok(),
-                            name: "paint_seed".to_string(),
-                        });
-                        fields.push(EventField {
-                            data: self.find_stickers(&purchase.weapon_entid).ok(),
-                            name: "stickers".to_string(),
-                        });
-                        let custom_name = if let Some(custom_name_id) = self.prop_controller.special_ids.custom_name {
-                            self.get_prop_from_ent(&custom_name_id, &purchase.weapon_entid).ok()
-                        } else {
-                            None
-                        };
-                        fields.push(EventField {
-                            data: custom_name,
-                            name: "custom_name".to_string(),
-                        });
-                        fields.extend(self.find_extra_props_events(purchase.entid, "user"));
-                        fields.extend(self.find_non_player_props());
-                        let ge = GameEvent {
-                            name: "item_purchase".to_string(),
-                            fields,
-                            tick: self.tick,
-                        };
-                        self.game_events.push(ge);
-                        self.game_events_counter.insert("item_purchase".to_string());
                     }
+                    None => {
+                        fields.push(EventField {
+                            data: None,
+                            name: "item_name".to_string(),
+                        });
+                    }
+                }
+                fields.push(EventField {
+                    data: self.create_name(player).ok(),
+                    name: "name".to_string(),
+                });
+                fields.push(EventField {
+                    data: Some(Variant::U64(player.steamid.unwrap_or(0))),
+                    name: "steamid".to_string(),
+                });
+                fields.push(EventField {
+                    data: Some(Variant::U32(purchase.inventory_slot)),
+                    name: "inventory_slot".to_string(),
+                });
+                fields.push(EventField {
+                    data: Some(Variant::I32(purchase.cost)),
+                    name: "cost".to_string(),
+                });
+                fields.push(EventField {
+                    data: Some(Variant::I32(self.tick)),
+                    name: "tick".to_string(),
+                });
+                fields.push(EventField {
+                    data: self.get_prop_from_ent(&WEAPON_FLOAT, &purchase.weapon_entid).ok(),
+                    name: "float".to_string(),
+                });
+                fields.push(EventField {
+                    data: self.find_weapon_skin(&purchase.weapon_entid).ok(),
+                    name: "skin".to_string(),
+                });
+                fields.push(EventField {
+                    data: self.find_weapon_skin_id(&purchase.weapon_entid).ok(),
+                    name: "skin_id".to_string(),
+                });
+                fields.push(EventField {
+                    data: self.get_prop_from_ent(&WEAPON_PAINT_SEED, &purchase.weapon_entid).ok(),
+                    name: "paint_seed".to_string(),
+                });
+                fields.push(EventField {
+                    data: self.find_stickers(&purchase.weapon_entid).ok(),
+                    name: "stickers".to_string(),
+                });
+                let custom_name = if let Some(custom_name_id) = self.prop_controller.special_ids.custom_name {
+                    self.get_prop_from_ent(&custom_name_id, &purchase.weapon_entid).ok()
+                } else {
+                    None
+                };
+                fields.push(EventField {
+                    data: custom_name,
+                    name: "custom_name".to_string(),
+                });
+                fields.extend(self.find_extra_props_events(purchase.entid, "user"));
+                fields.extend(self.find_non_player_props());
+                let ge = GameEvent {
+                    name: "item_purchase".to_string(),
+                    fields,
+                    tick: self.tick,
+                };
+                self.game_events.push(ge);
+                self.game_events_counter.insert("item_purchase".to_string());
+            }
         }
     }
     fn extract_win_reason(&self, events: &[GameEventInfo]) -> Option<Variant> {
@@ -1122,17 +1198,10 @@ impl<'a> SecondPassParser<'a> {
         Ok(())
     }
 
-    pub fn create_custom_event_player_bullet_hit(
-        &mut self,
-        msg_bytes: &[u8],
-    ) -> Result<(), DemoParserError> {
+    pub fn create_custom_event_player_bullet_hit(&mut self, msg_bytes: &[u8]) -> Result<(), DemoParserError> {
+        self.game_events_counter.insert("player_bullet_hit".to_string());
 
-        self.game_events_counter
-            .insert("player_bullet_hit".to_string());
-
-        if !self.wanted_events.contains(&"player_bullet_hit".to_string())
-            && self.wanted_events.first() != Some(&"all".to_string())
-        {
+        if !self.wanted_events.contains(&"player_bullet_hit".to_string()) && self.wanted_events.first() != Some(&"all".to_string()) {
             return Ok(());
         }
 
@@ -1208,10 +1277,7 @@ impl<'a> SecondPassParser<'a> {
 
         Ok(())
     }
-    pub fn create_custom_event_player_connect(
-        &mut self,
-        player_metadata: &PlayerMetaData,
-    ) -> Result<(), DemoParserError> {
+    pub fn create_custom_event_player_connect(&mut self, player_metadata: &PlayerMetaData) -> Result<(), DemoParserError> {
         self.game_events_counter.insert("player_first_connect".to_string());
         if !self.wanted_events.contains(&"player_first_connect".to_string()) && self.wanted_events.first() != Some(&"all".to_string()) {
             return Ok(());
@@ -1229,7 +1295,7 @@ impl<'a> SecondPassParser<'a> {
             data: Some(Variant::String(player_metadata.clone().name.unwrap_or("".to_string()))),
             name: "name".to_string(),
         });
-        let team=  match player_metadata.team_num {
+        let team = match player_metadata.team_num {
             Some(1) => "spectator",
             Some(2) => "T",
             Some(3) => "CT",
@@ -1253,21 +1319,14 @@ impl<'a> SecondPassParser<'a> {
             tick: self.tick,
         };
         self.game_events.push(ge);
-    
+
         Ok(())
     }
 
-    pub fn create_custom_event_fire_bullets(
-        &mut self,
-        msg_bytes: &[u8],
-    ) -> Result<(), DemoParserError> {
+    pub fn create_custom_event_fire_bullets(&mut self, msg_bytes: &[u8]) -> Result<(), DemoParserError> {
+        self.game_events_counter.insert("fire_bullets".to_string());
 
-        self.game_events_counter
-            .insert("fire_bullets".to_string());
-
-        if !self.wanted_events.contains(&"fire_bullets".to_string())
-            && self.wanted_events.first() != Some(&"all".to_string())
-        {
+        if !self.wanted_events.contains(&"fire_bullets".to_string()) && self.wanted_events.first() != Some(&"all".to_string()) {
             return Ok(());
         }
 
@@ -1281,6 +1340,11 @@ impl<'a> SecondPassParser<'a> {
         fields.push(EventField {
             name: "tick".to_string(),
             data: Some(Variant::I32(self.tick)),
+        });
+
+        fields.push(EventField {
+            name: "message_tick".to_string(),
+            data: msg.tick.map(Variant::I32),
         });
 
         fields.push(EventField {
@@ -1401,6 +1465,55 @@ impl<'a> SecondPassParser<'a> {
             name: "player_scoped".to_string(),
             data: msg.player_scoped.map(Variant::Bool),
         });
+        fields.push(EventField {
+            name: "aim_punch_x".to_string(),
+            data: msg
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.aim_punch.as_ref().and_then(|angle| angle.x).map(Variant::F32)),
+        });
+        fields.push(EventField {
+            name: "aim_punch_y".to_string(),
+            data: msg
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.aim_punch.as_ref().and_then(|angle| angle.y).map(Variant::F32)),
+        });
+        fields.push(EventField {
+            name: "aim_punch_z".to_string(),
+            data: msg
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.aim_punch.as_ref().and_then(|angle| angle.z).map(Variant::F32)),
+        });
+        fields.push(EventField {
+            name: "attack_tick_count".to_string(),
+            data: msg.extra.as_ref().and_then(|extra| extra.attack_tick_count.map(Variant::I32)),
+        });
+        fields.push(EventField {
+            name: "attack_tick_fraction".to_string(),
+            data: msg.extra.as_ref().and_then(|extra| extra.attack_tick_frac.map(Variant::F32)),
+        });
+        fields.push(EventField {
+            name: "render_tick_count".to_string(),
+            data: msg.extra.as_ref().and_then(|extra| extra.render_tick_count.map(Variant::I32)),
+        });
+        fields.push(EventField {
+            name: "render_tick_fraction".to_string(),
+            data: msg.extra.as_ref().and_then(|extra| extra.render_tick_frac.map(Variant::F32)),
+        });
+        fields.push(EventField {
+            name: "inaccuracy_move".to_string(),
+            data: msg.extra.as_ref().and_then(|extra| extra.inaccuracy_move.map(Variant::F32)),
+        });
+        fields.push(EventField {
+            name: "inaccuracy_air".to_string(),
+            data: msg.extra.as_ref().and_then(|extra| extra.inaccuracy_air.map(Variant::F32)),
+        });
+        fields.push(EventField {
+            name: "extra_type".to_string(),
+            data: msg.extra.as_ref().and_then(|extra| extra.r#type.map(Variant::I32)),
+        });
         let entity_id = entity_handle_index(msg.player.unwrap_or(0));
         fields.push(self.create_player_name_field(entity_id, "user"));
         fields.push(self.create_player_steamid_field(entity_id, "user"));
@@ -1414,7 +1527,6 @@ impl<'a> SecondPassParser<'a> {
         self.game_events.push(ge);
         Ok(())
     }
-
 
     pub fn create_custom_event_rank_update(&mut self, msg_bytes: &[u8]) -> Result<(), DemoParserError> {
         self.game_events_counter.insert("rank_update".to_string());
@@ -1479,20 +1591,20 @@ impl<'a> SecondPassParser<'a> {
         field_info: Option<FieldInfo>,
         prop_controller: &PropController,
         special_ids: &SpecialIDs,
-        is_fullpacket:bool,
+        is_fullpacket: bool,
         events: &mut Vec<GameEventInfo>,
     ) {
         // Might want to start splitting this function
         if let Some(fi) = field_info {
-            if entity.entity_type == EntityType::PlayerController{
-                if let Some(f) = field_info{
-                    let connect_ids = [special_ids.teamnum,  special_ids.player_name, special_ids.steamid, special_ids.player_pawn];
+            if entity.entity_type == EntityType::PlayerController {
+                if let Some(f) = field_info {
+                    let connect_ids = [special_ids.teamnum, special_ids.player_name, special_ids.steamid, special_ids.player_pawn];
                     if connect_ids.contains(&Some(f.prop_id)) {
                         events.push(GameEventInfo::PlayerConnect(entity.entity_id));
                     }
                 }
             }
-            if is_fullpacket{
+            if is_fullpacket {
                 return;
             }
 

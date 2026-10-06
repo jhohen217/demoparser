@@ -3,7 +3,7 @@
 //!
 //! Singular fields retain protobuf wire encoding except for wire type 7,
 //! which resets a field to its declared default. The repeated input-history
-//! and subtick fields use the replacement-list encoding observed in current
+//! and subtick fields resize and partially update the previous list in current
 //! CS2 demos. Unknown or malformed operations fail the whole delta so callers
 //! can keep the previous per-player baseline unchanged.
 
@@ -104,6 +104,8 @@ enum MessageSchema {
     QAngle,
     InputHistory,
     SubtickMove,
+    Interpolation,
+    InterpolationCl,
 }
 
 impl MessageSchema {
@@ -134,6 +136,15 @@ impl MessageSchema {
                 5 | 7 => Some(5),
                 _ => None,
             },
+            Self::Interpolation => match field {
+                1 | 2 => Some(0),
+                3 => Some(5),
+                _ => None,
+            },
+            Self::InterpolationCl => match field {
+                3 => Some(5),
+                _ => None,
+            },
             Self::SubtickMove => match field {
                 1 | 2 => Some(0),
                 3 | 4 | 5 | 8 | 9 => Some(5),
@@ -147,7 +158,9 @@ impl MessageSchema {
             (Self::CsgoUserCmd, 1) => Some(Self::BaseUserCmd),
             (Self::BaseUserCmd, 3) => Some(Self::Buttons),
             (Self::BaseUserCmd, 4) => Some(Self::QAngle),
-            (Self::InputHistory, 2 | 69) => Some(Self::QAngle),
+            (Self::InputHistory, 12) => Some(Self::InterpolationCl),
+            (Self::InputHistory, 13..=15) => Some(Self::Interpolation),
+            (Self::InputHistory, 2 | 66..=69) => Some(Self::QAngle),
             _ => None,
         }
     }
@@ -178,7 +191,25 @@ impl MessageSchema {
             ],
             Self::Buttons => &[(1, 0), (2, 0), (3, 0)],
             Self::QAngle => &[(1, 5), (2, 5), (3, 5)],
-            Self::InputHistory => &[(2, 2), (4, 0), (5, 5), (6, 0), (7, 5), (64, 0), (65, 0)],
+            Self::InputHistory => &[
+                (2, 2),
+                (4, 0),
+                (5, 5),
+                (6, 0),
+                (7, 5),
+                (12, 2),
+                (13, 2),
+                (14, 2),
+                (15, 2),
+                (66, 2),
+                (67, 2),
+                (68, 2),
+                (69, 2),
+                (64, 0),
+                (65, 0),
+            ],
+            Self::Interpolation => &[(1, 0), (2, 0), (3, 5)],
+            Self::InterpolationCl => &[(3, 5)],
             Self::SubtickMove => &[(1, 0), (2, 0), (3, 5), (4, 5), (5, 5), (8, 5), (9, 5)],
         }
     }
@@ -187,7 +218,7 @@ impl MessageSchema {
         match wire_type {
             0 => {
                 let value = match (self, field) {
-                    (Self::CsgoUserCmd, 6 | 7) | (Self::InputHistory, 65) => u64::MAX,
+                    (Self::CsgoUserCmd, 6 | 7) | (Self::InputHistory, 65) | (Self::Interpolation, 1 | 2) => u64::MAX,
                     (Self::BaseUserCmd, 14) => 0x00ff_ffff,
                     _ => 0,
                 };
@@ -280,6 +311,7 @@ where
     let mut declared_count = None;
     for payload in payloads {
         let mut bytes = payload.as_ref();
+        if bytes.is_empty() { messages.clear(); continue; }
         if !bytes.is_empty() {
             let mut after_marker = bytes;
             let marker = read_varint(&mut after_marker)?;
@@ -295,7 +327,8 @@ where
         }
         while !bytes.is_empty() {
             let key = read_varint(&mut bytes)?;
-            if key & 0x07 != 2 {
+            let index = usize::try_from(key >> 3).ok()?;
+            if index > 4096 {
                 return None;
             }
             let index = usize::try_from(key >> 3).ok()?;
@@ -329,7 +362,8 @@ fn merge_qangle(target: &mut Option<CMsgQAngle>, delta: CMsgQAngle) {
     replace_if_some(&mut target.z, delta.z);
 }
 
-pub(super) fn apply_delta(baseline: &CsgoUserCmdPb, delta_data: &[u8]) -> Option<CsgoUserCmdPb> {
+/// Apply a complete command delta, preserving omitted list and nested fields.
+pub fn apply_delta(baseline: &CsgoUserCmdPb, delta_data: &[u8]) -> Option<CsgoUserCmdPb> {
     let sanitized = sanitize_message(delta_data, MessageSchema::CsgoUserCmd)?;
     let delta = DeltaCsgoUserCmdPb::decode(sanitized.as_slice()).ok()?;
     let mut next = baseline.clone();
@@ -381,6 +415,20 @@ pub(super) fn apply_delta(baseline: &CsgoUserCmdPb, delta_data: &[u8]) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_presence_merge_distinguishes_missing_inherited_and_explicit_zero() {
+        let mut unknown = None;
+        merge_buttons(&mut unknown, CInButtonStatePb::default());
+        assert_eq!(unknown.as_ref().unwrap().buttonstate1, None);
+        let mut known = Some(CInButtonStatePb { buttonstate1: Some(1), ..Default::default() });
+        merge_buttons(&mut known, CInButtonStatePb::default());
+        assert_eq!(known.as_ref().unwrap().buttonstate1, Some(1));
+        merge_buttons(&mut known, CInButtonStatePb { buttonstate1: Some(0), ..Default::default() });
+        assert_eq!(known.as_ref().unwrap().buttonstate1, Some(0));
+        merge_buttons(&mut known, CInButtonStatePb::default());
+        assert_eq!(known.as_ref().unwrap().buttonstate1, Some(0));
+    }
+
 
     #[test]
     fn merges_july_usercmd_fields_and_repeated_subticks() {
@@ -412,38 +460,49 @@ mod tests {
     }
 
     #[test]
-    fn repeated_marker_declares_multiple_elements() {
-        let payload = prost::bytes::Bytes::from_static(&[
-            0x17, 0x02, 0x09, 0x08, 0x01, 0x10, 0x01, 0x1d, 0x00, 0x00, 0xb0, 0x3e, 0x0a, 0x0a, 0x08, 0x80, 0x10, 0x10, 0x01, 0x1d, 0x00, 0x00, 0xb0, 0x3e,
-        ]);
-
-        let decoded = decode_repeated::<csgoproto::CSubtickMoveStep>(&[payload], MessageSchema::SubtickMove, &[]).unwrap();
-
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].button, Some(1));
-        assert_eq!(decoded[1].button, Some(2048));
+    fn partial_history_update_preserves_prior_fields_and_resizes() {
+        let mut baseline = CsgoUserCmdPb::default();
+        baseline.input_history = vec![csgoproto::CsgoInputHistoryEntryPb {
+            render_tick_count: Some(100),
+            player_tick_count: Some(105),
+            ..Default::default()
+        }];
+        // Resize to two, update only entry zero's render tick, append entry one.
+        let next = apply_delta(&baseline, &[0x12, 0x08, 0x17, 0x02, 0x02, 0x20, 0x65, 0x0a, 0x00, 0x00]);
+        assert!(next.is_none()); // Trailing malformed operation fails the whole delta.
+        let next = apply_delta(&baseline, &[0x12, 0x07, 0x17, 0x02, 0x02, 0x20, 0x65, 0x0a, 0x00]).unwrap();
+        assert_eq!(next.input_history.len(), 2);
+        assert_eq!(next.input_history[0].render_tick_count(), 101);
+        assert_eq!(next.input_history[0].player_tick_count(), 105);
+        assert_eq!(baseline.input_history.len(), 1);
+        let cleared = apply_delta(&next, &[0x17]).unwrap();
+        assert!(cleared.input_history.is_empty());
     }
 
     #[test]
-    fn repeated_delta_allows_sparse_indices_and_merges_element_baselines() {
-        let previous = vec![
-            csgoproto::CSubtickMoveStep::default(),
-            csgoproto::CSubtickMoveStep {
-                button: Some(2),
-                pressed: Some(true),
-                when: Some(0.25),
-                ..Default::default()
-            },
-        ];
-        let payload = prost::bytes::Bytes::from_static(&[0x17, 0x0a, 0x02, 0x08, 0x04]);
+    fn reset_nested_interpolation_restores_declared_defaults() {
+        let mut baseline = CsgoUserCmdPb::default();
+        baseline.input_history = vec![csgoproto::CsgoInputHistoryEntryPb {
+            sv_interp0: Some(csgoproto::CsgoInterpolationInfoPb {
+                src_tick: Some(120),
+                dst_tick: Some(121),
+                frac: Some(0.5),
+            }),
+            ..Default::default()
+        }];
+        let next = apply_delta(&baseline, &[0x12, 0x03, 0x02, 0x01, 0x6f]).unwrap();
+        let interp = next.input_history[0].sv_interp0.as_ref().unwrap();
+        assert_eq!(interp.src_tick(), -1);
+        assert_eq!(interp.dst_tick(), -1);
+        assert_eq!(interp.frac(), 0.0);
+    }
 
-        let decoded = decode_repeated(&[payload], MessageSchema::SubtickMove, &previous).unwrap();
-
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0], csgoproto::CSubtickMoveStep::default());
-        assert_eq!(decoded[1].button, Some(4));
-        assert_eq!(decoded[1].pressed, Some(true));
-        assert_eq!(decoded[1].when, Some(0.25));
+    #[test]
+    fn rejects_missing_repeated_entry_without_mutating_baseline() {
+        let baseline = CsgoUserCmdPb::default();
+        let delta = [0x12, 0x02, 0x0a, 0x00];
+        assert!(apply_delta(&baseline, &delta).is_none());
+        assert_eq!(baseline, CsgoUserCmdPb::default());
     }
 
     #[test]
@@ -483,4 +542,40 @@ mod tests {
         assert_eq!(command.attack1_start_history_index, Some(-1));
         assert_eq!(command.base.unwrap().pawn_entity_handle, Some(0x00ff_ffff));
     }
+    #[test]
+    fn repeated_marker_declares_multiple_elements() {
+        let payload = prost::bytes::Bytes::from_static(&[
+            0x17, 0x02, 0x09, 0x08, 0x01, 0x10, 0x01, 0x1d, 0x00, 0x00, 0xb0, 0x3e, 0x0a, 0x0a, 0x08, 0x80, 0x10, 0x10, 0x01, 0x1d, 0x00, 0x00, 0xb0, 0x3e,
+        ]);
+
+        let decoded = decode_repeated::<csgoproto::CSubtickMoveStep>(&[payload], MessageSchema::SubtickMove, &[]).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].button, Some(1));
+        assert_eq!(decoded[1].button, Some(2048));
+    }
+
+    #[test]
+    fn repeated_delta_allows_sparse_indices_and_merges_element_baselines() {
+        let previous = vec![
+            csgoproto::CSubtickMoveStep::default(),
+            csgoproto::CSubtickMoveStep {
+                button: Some(2),
+                pressed: Some(true),
+                when: Some(0.25),
+                ..Default::default()
+            },
+        ];
+        let payload = prost::bytes::Bytes::from_static(&[0x17, 0x0a, 0x02, 0x08, 0x04]);
+
+        let decoded = decode_repeated(&[payload], MessageSchema::SubtickMove, &previous).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0], csgoproto::CSubtickMoveStep::default());
+        assert_eq!(decoded[1].button, Some(4));
+        assert_eq!(decoded[1].pressed, Some(true));
+        assert_eq!(decoded[1].when, Some(0.25));
+    }
+
+
 }

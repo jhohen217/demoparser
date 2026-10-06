@@ -1,0 +1,23 @@
+pub mod atomic_write;
+pub mod button_press;
+pub mod cache;
+pub mod cli;
+pub mod collection_processor;
+pub mod config_manager;
+pub mod data_extraction;
+pub mod data_processing;
+pub mod data_types;
+pub mod demo_loader;
+pub mod grenade_processor;
+pub mod kill_collection_parser;
+pub mod parser_config;
+pub mod player_states;
+pub mod utility;
+mod utility_binary;
+pub mod weapon_materials;
+pub mod s2r_output;
+pub mod team_parser;
+pub mod velocity_processing;
+// pub mod weapon_fire_detector; // DISABLED - moved to weapon_fire_detector_old.rs
+pub mod weapon_inspect;
+pub mod weapon_mapper;

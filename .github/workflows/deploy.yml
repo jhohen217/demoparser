@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   windows:
+    if: github.repository == 'LaihoE/demoparser'
     runs-on: windows-latest
     strategy:
       matrix:
@@ -42,6 +43,7 @@ jobs:
           args: -i ${{ matrix.python-version }} --no-sdist --skip-existing -m src/python/Cargo.toml
 
   linux:
+    if: github.repository == 'LaihoE/demoparser'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -82,6 +84,7 @@ jobs:
 
 
   macos:
+    if: github.repository == 'LaihoE/demoparser'
     runs-on: macos-latest
     strategy:
       matrix:

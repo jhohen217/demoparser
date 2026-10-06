@@ -6,6 +6,10 @@ use crate::first_pass::sendtables::Serializer;
 use crate::first_pass::stringtables::StringTable;
 use crate::first_pass::stringtables::UserInfo;
 use crate::maps::BUTTONMAP;
+use crate::second_pass::audio::AudioEvent;
+use crate::second_pass::smoke_voxels::{SmokeVoxelCapture, SMOKE_VOXEL_PROPERTY};
+use crate::second_pass::world_entities::{WorldEntityCapture, WORLD_ENTITY_PROPERTY};
+use crate::second_pass::world_entity_audit::{WorldEntityAuditCapture, WORLD_ENTITY_AUDIT_PROPERTY};
 use crate::second_pass::collect_data::ProjectileRecord;
 use crate::second_pass::decoder::QfMapper;
 use crate::second_pass::entities::Entity;
@@ -15,6 +19,8 @@ use crate::second_pass::other_netmessages::Class;
 use crate::second_pass::parser::SecondPassOutput;
 use crate::second_pass::path_ops::FieldPath;
 use crate::second_pass::variants::PropColumn;
+use crate::second_pass::variants::Sticker;
+use crate::second_pass::variants::Variant;
 use ahash::AHashMap;
 use ahash::AHashSet;
 use ahash::HashMap;
@@ -69,6 +75,10 @@ pub struct SecondPassParser<'a> {
     pub cls_bits: Option<u32>,
     pub entities: Vec<Option<Entity>>,
     pub tick: i32,
+    /// Absolute source-frame offset and zero-based packet index provide a
+    /// deterministic order across independently parsed second-pass chunks.
+    pub current_demo_frame_offset: u64,
+    pub current_network_message_index: u32,
     pub players: BTreeMap<i32, PlayerMetaData>,
     pub teams: Teams,
     pub huffman_lookup_table: &'a [(u8, u8)],
@@ -81,11 +91,21 @@ pub struct SecondPassParser<'a> {
     pub baselines: AHashMap<u32, Vec<u8>, RandomState>,
     pub projectiles: BTreeSet<i32>,
     pub fullpackets_parsed: u32,
+    /// Tick of the last `DEM_Packet` this parser consumed, or `i32::MIN` before the first
+    /// one. Used to notice that the stream jumped — see `parse_full_packet_and_break_if_needed`.
+    pub last_packet_tick: i32,
     pub wanted_players: AHashSet<u64>,
     pub wanted_ticks: AHashSet<i32>,
     // Output from parsing
     pub projectile_records: Vec<ProjectileRecord>,
     pub voice_data: Vec<(i32, CsvcMsgVoiceData)>,
+    pub audio_events: Vec<AudioEvent>,
+    pub ag2_recipes: crate::second_pass::ag2_recipes::Ag2RecipeCapture,
+    pub smoke_voxels: SmokeVoxelCapture,
+    pub infernos: crate::second_pass::infernos::InfernoCapture,
+    pub utility: crate::second_pass::utility::UtilityCapture,
+    pub world_entity_audit: WorldEntityAuditCapture,
+    pub world_entities: WorldEntityCapture,
     pub output: AHashMap<u32, PropColumn, RandomState>,
     pub header: HashMap<String, String>,
     pub skins: Vec<EconItem>,
@@ -93,6 +113,8 @@ pub struct SecondPassParser<'a> {
     pub convars: AHashMap<String, String>,
     pub chat_messages: Vec<ChatMessageRecord>,
     pub player_end_data: Vec<PlayerEndMetaData>,
+    pub weapon_entity_snapshots: Vec<WeaponEntitySnapshot>,
+    pub weapon_baseline_captured: bool,
     // Settings
     pub wanted_events: Vec<String>,
     pub parse_entities: bool,
@@ -149,6 +171,55 @@ pub struct EconItem {
     pub item_name: Option<String>,
     pub skin_name: Option<String>,
 }
+/// Tick-local weapon entity state. Entity IDs/handles are intentionally kept
+/// separate from item-id halves: the former are reused by Source 2, the latter
+/// are the durable identity when present in the packet stream.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeaponEntitySnapshot {
+    pub tick: i32,
+    /// Stable source ordering across packets/chunks; used for same-tick ownership
+    /// transitions and delete/recreate ordering.
+    pub source_order: u64,
+    pub entity_id: i32,
+    pub entity_serial: u32,
+    pub class_name: String,
+    pub item_id_high: Option<u32>,
+    pub item_id_low: Option<u32>,
+    pub item_definition_index: Option<u32>,
+    pub paint_kit_id: Option<u32>,
+    pub paint_seed: Option<u32>,
+    pub wear: Option<f32>,
+    /// Definition/value pairs; consumers must select by definition index, not
+    /// vector position.
+    pub econ_attributes: Vec<EconAttribute>,
+    pub stickers: Vec<Sticker>,
+    pub current_owner_handle: Option<u32>,
+    pub owner_steamid: Option<u64>,
+    /// Ordinal in the owning pawn's m_hMyWeapons network vector.
+    pub inventory_slot: Option<i32>,
+    /// CEconItemView inventory position. This is not the gameplay weapon slot.
+    pub econ_inventory_position: Option<i32>,
+    pub active: Option<bool>,
+    pub clip_ammo: Option<i32>,
+    pub reserve_ammo: Option<i32>,
+    pub position: Option<[f32; 3]>,
+    pub rotation: Option<[f32; 3]>,
+    /// Raw packet PVS transition bits; absent means the packet supplied none.
+    pub pvs_state: Option<u8>,
+    pub current_owner_id: Option<u32>,
+    pub previous_owner_handle: Option<u32>,
+    pub original_owner_xuid_low: Option<u32>,
+    pub original_owner_xuid_high: Option<u32>,
+    pub dropped_at_time: Option<f32>,
+    /// Native material input; not an inspection-button timestamp.
+    pub last_shake_time: Option<f32>,
+    pub present: bool,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct EconAttribute {
+    pub definition_index: u32,
+    pub raw_value: Variant,
+}
 #[derive(Debug, Clone)]
 pub struct PlayerEndMetaData {
     pub steamid: Option<u64>,
@@ -157,8 +228,20 @@ pub struct PlayerEndMetaData {
 }
 
 impl<'a> SecondPassParser<'a> {
-    pub fn create_output(self) -> SecondPassOutput {
+    pub fn create_output(mut self) -> SecondPassOutput {
+        let smoke_voxels = std::mem::take(&mut self.smoke_voxels).finish(self.tick);
+        let infernos = std::mem::take(&mut self.infernos).finish(self.tick);
+        let world_entity_audit = std::mem::take(&mut self.world_entity_audit).finish();
+        let world_entities = std::mem::take(&mut self.world_entities).finish(self.tick);
+        let ag2_recipes = std::mem::take(&mut self.ag2_recipes).finish(self.tick);
         SecondPassOutput {
+            ag2_recipes,
+            audio_events: self.audio_events,
+            smoke_voxels,
+            infernos,
+            utility: self.utility.finish(),
+            world_entity_audit,
+            world_entities,
             voice_data: self.voice_data,
             chat_messages: self.chat_messages,
             convars: self.convars,
@@ -168,6 +251,7 @@ impl<'a> SecondPassParser<'a> {
             item_drops: self.item_drops,
             header: None,
             player_md: self.player_end_data,
+            weapon_entity_snapshots: self.weapon_entity_snapshots,
             roster: self
                 .players
                 .values()
@@ -202,6 +286,22 @@ impl<'a> SecondPassParser<'a> {
         let debug = if args.len() > 2 { args[2] == "true" } else { false };
 
         Ok(SecondPassParser {
+            ag2_recipes: crate::second_pass::ag2_recipes::Ag2RecipeCapture::new(first_pass_output.capture_animation_recipes),
+            audio_events: vec![],
+            infernos: crate::second_pass::infernos::InfernoCapture::new(first_pass_output.settings.parse_grenades),
+            utility: crate::second_pass::utility::UtilityCapture::new(
+                first_pass_output.settings.parse_grenades && first_pass_output.settings.parse_ents),
+            world_entities: WorldEntityCapture::new(
+                first_pass_output.settings.wanted_player_props.iter()
+                    .any(|property| property == WORLD_ENTITY_PROPERTY)),
+            world_entity_audit: WorldEntityAuditCapture::new(
+                first_pass_output.settings.wanted_player_props.iter()
+                    .any(|property| property == WORLD_ENTITY_AUDIT_PROPERTY)),
+            smoke_voxels: SmokeVoxelCapture::new(
+                first_pass_output.settings.wanted_player_props.iter()
+                    .any(|property| property.rsplit('.').next() == Some(SMOKE_VOXEL_PROPERTY))),
+            current_demo_frame_offset: 0,
+            current_network_message_index: 0,
             velocity_history: AHashMap::default(),
             uniq_prop_names: AHashSet::default(),
             parse_usercmd: contains_usercmd_prop(&first_pass_output.settings.wanted_player_props),
@@ -230,6 +330,7 @@ impl<'a> SecondPassParser<'a> {
             prop_controller: &first_pass_output.prop_controller,
             qf_mapper: &first_pass_output.qfmap,
             fullpackets_parsed: 0,
+            last_packet_tick: i32::MIN,
             serializers: AHashMap::default(),
             ptr: offset,
             ge_list: first_pass_output.ge_list,
@@ -255,6 +356,8 @@ impl<'a> SecondPassParser<'a> {
             item_drops: vec![],
             skins: vec![],
             player_end_data: vec![],
+            weapon_entity_snapshots: vec![],
+            weapon_baseline_captured: false,
             huffman_lookup_table: &first_pass_output.settings.huffman_lookup_table,
             header: HashMap::default(),
             list_props: first_pass_output.list_props,

@@ -6,8 +6,9 @@ use crate::first_pass::prop_controller::*;
 use crate::first_pass::read_bits::DemoParserError;
 use crate::maps::BUTTONMAP;
 use crate::maps::PLAYER_COLOR;
-use crate::second_pass::entities::EntityType;
-use crate::second_pass::parser_settings::SecondPassParser;
+use crate::second_pass::entities::{Entity, EntityType};
+use crate::second_pass::parser_settings::WeaponEntitySnapshot;
+use crate::second_pass::parser_settings::{EconAttribute, SecondPassParser};
 use crate::second_pass::variants::PropColumn;
 use crate::second_pass::variants::VarVec;
 use csgoproto::maps::AGENTSMAP;
@@ -36,6 +37,12 @@ const CELL_BITS: i32 = 9;
 const MAX_COORD: f32 = (1 << 14) as f32;
 // https://github.com/markus-wa/demoinfocs-golang/blob/master/pkg/demoinfocs/constants/constants.go#L11
 const IS_AIRBORNE_CONST: u32 = 0xFFFFFF;
+const SOURCE2_ENTITY_ENTRY_MASK: u32 = (1 << 14) - 1;
+
+#[inline]
+fn handle_entity_index(handle: u32) -> i32 {
+    (handle & SOURCE2_ENTITY_ENTRY_MASK) as i32
+}
 
 #[derive(Debug, Clone)]
 pub struct ProjectileRecord {
@@ -54,6 +61,70 @@ pub enum CoordinateAxis {
     Z,
 }
 
+#[derive(Clone)]
+struct ActiveWeaponCosmetics {
+    paint: Option<u32>,
+    seed: Option<u32>,
+    wear: Option<f32>,
+    stickers: Vec<Sticker>,
+    /// Packed as [id, presence mask, x bits, y bits, z bits, seed,
+    /// highlight, sticker id, display-case id]. Optional values are selected
+    /// by mask bits 0..=6; the representation stays inside the parser column.
+    keychain: Vec<u32>,
+}
+
+fn variant_u32(value: &Variant) -> Option<u32> {
+    match value {
+        Variant::U32(v) => Some(*v),
+        Variant::I32(v) if *v >= 0 => Some(*v as u32),
+        // Econ attributes are commonly network-decoded as f32. Paint/seed are
+        // integer-valued floats; wear must keep the f32 representation instead.
+        Variant::F32(v) if v.is_finite() && *v >= 0.0 && v.fract() == 0.0 => Some(*v as u32),
+        _ => None,
+    }
+}
+
+/// Sticker IDs are integer bit patterns carried by the f32 network field.
+/// Paint/seed deliberately use `variant_u32` above because those are numeric
+/// floats, so this conversion must remain attribute-specific.
+fn variant_raw_u32(value: &Variant) -> Option<u32> {
+    match value {
+        Variant::U32(v) => Some(*v),
+        Variant::I32(v) if *v >= 0 => Some(*v as u32),
+        Variant::F32(v) => Some(v.to_bits()),
+        _ => None,
+    }
+}
+
+/// Source stores the pattern seed as a numeric float; the fractional payload
+/// is not part of the seed. This mirrors the game's `float_floor_to_integer`
+/// schema rule for attribute 7 without accepting bit-container values.
+fn variant_numeric_u32(value: &Variant) -> Option<u32> {
+    match value {
+        Variant::U32(v) => Some(*v),
+        Variant::I32(v) if *v >= 0 => Some(*v as u32),
+        Variant::F32(v) if v.is_finite() && *v >= 0.0 => Some(*v as u32),
+        _ => None,
+    }
+}
+
+fn variant_f32(value: &Variant) -> Option<f32> {
+    match value {
+        Variant::F32(v) if v.is_finite() => Some(*v),
+        Variant::U32(v) => Some(f32::from_bits(*v)),
+        _ => None,
+    }
+}
+
+fn variant_i32(value: &Variant) -> Option<i32> {
+    match value {
+        Variant::I32(v) => Some(*v),
+        Variant::U32(v) => i32::try_from(*v).ok(),
+        Variant::F32(v) if v.is_finite() => Some(*v as i32),
+        _ => None,
+    }
+}
+
 // This file collects the data that is converted into a dataframe in the end in parser.parse_ticks()
 
 impl<'a> SecondPassParser<'a> {
@@ -68,6 +139,10 @@ impl<'a> SecondPassParser<'a> {
                 self.update_velocity_history();
             }
             return;
+        }
+        if self.prop_controller.capture_weapon_entities && !self.weapon_baseline_captured {
+            self.collect_weapon_entity_snapshots();
+            self.weapon_baseline_captured = true;
         }
         if self.parse_projectiles {
             self.collect_projectiles();
@@ -98,10 +173,18 @@ impl<'a> SecondPassParser<'a> {
             }
             let mut velocity_indicies: Option<Vec<usize>> = None;
             let mut button_mask: Option<Option<u64>> = None;
+            let mut active_weapon_cosmetics: Option<Option<ActiveWeaponCosmetics>> = None;
             if self.order_by_steamid {
                 for prop_info in &self.prop_controller.prop_infos {
                     // find_prop borrows &self; resolve the value before the &mut df_per_player borrow.
-                    let val = self.find_prop_with_collect_cache(prop_info, entity_id, player, &mut velocity_indicies, &mut button_mask);
+                    let val = self.find_prop_with_collect_cache(
+                        prop_info,
+                        entity_id,
+                        player,
+                        &mut velocity_indicies,
+                        &mut button_mask,
+                        &mut active_weapon_cosmetics,
+                    );
                     self.df_per_player
                         .entry(player_steamid)
                         .or_default()
@@ -111,11 +194,15 @@ impl<'a> SecondPassParser<'a> {
                 }
             } else {
                 for prop_info in &self.prop_controller.prop_infos {
-                    let val = self.find_prop_with_collect_cache(prop_info, entity_id, player, &mut velocity_indicies, &mut button_mask);
-                    self.output
-                        .entry(prop_info.id)
-                        .or_insert_with(PropColumn::new)
-                        .push(val);
+                    let val = self.find_prop_with_collect_cache(
+                        prop_info,
+                        entity_id,
+                        player,
+                        &mut velocity_indicies,
+                        &mut button_mask,
+                        &mut active_weapon_cosmetics,
+                    );
+                    self.output.entry(prop_info.id).or_insert_with(PropColumn::new).push(val);
                 }
             }
         }
@@ -136,12 +223,29 @@ impl<'a> SecondPassParser<'a> {
         player: &PlayerMetaData,
         velocity_indicies: &mut Option<Vec<usize>>,
         button_mask: &mut Option<Option<u64>>,
+        active_weapon_cosmetics: &mut Option<Option<ActiveWeaponCosmetics>>,
     ) -> Option<Variant> {
         match prop_info.id {
             VELOCITY_ID => self.collect_velocity_cached(player, velocity_indicies).ok(),
             VELOCITY_X_ID => self.collect_velocity_axis_cached(player, CoordinateAxis::X, velocity_indicies).ok(),
             VELOCITY_Y_ID => self.collect_velocity_axis_cached(player, CoordinateAxis::Y, velocity_indicies).ok(),
             VELOCITY_Z_ID => self.collect_velocity_axis_cached(player, CoordinateAxis::Z, velocity_indicies).ok(),
+            WEAPON_SKIN_NAME | WEAPON_SKIN_ID | WEAPON_PAINT_SEED | WEAPON_FLOAT | WEAPON_STICKERS_ID | WEAPON_KEYCHAIN_ID => {
+                let cosmetics = active_weapon_cosmetics.get_or_insert_with(|| self.active_weapon_cosmetics(*entity_id));
+                match prop_info.id {
+                    WEAPON_SKIN_NAME => cosmetics.as_ref().and_then(|bundle| {
+                        bundle
+                            .paint
+                            .and_then(|paint| PAINTKITS.get(&paint).map(|name| Variant::String(name.to_string())))
+                    }),
+                    WEAPON_SKIN_ID => cosmetics.as_ref().and_then(|bundle| bundle.paint.map(Variant::U32)),
+                    WEAPON_PAINT_SEED => Some(Variant::U32(cosmetics.as_ref().and_then(|bundle| bundle.seed).unwrap_or(0))),
+                    WEAPON_FLOAT => cosmetics.as_ref().and_then(|bundle| bundle.wear.map(Variant::F32)),
+                    WEAPON_STICKERS_ID => cosmetics.as_ref().map(|bundle| Variant::Stickers(bundle.stickers.clone())),
+                    WEAPON_KEYCHAIN_ID => cosmetics.as_ref().map(|bundle| Variant::U32Vec(bundle.keychain.clone())),
+                    _ => unreachable!(),
+                }
+            }
             _ if prop_info.prop_type == PropType::Button => self.get_button_prop_cached(prop_info, entity_id, button_mask).ok(),
             _ => self.find_prop(prop_info, entity_id, player).ok(),
         }
@@ -170,6 +274,195 @@ impl<'a> SecondPassParser<'a> {
             },
             _ => return Err(PropCollectionError::GetPropFromEntEntityNotFound),
         }
+    }
+
+    /// Return typed CEconItem attributes by correlating the vector slot of
+    /// `m_iAttributeDefinitionIndex` with the same slot of `m_iRawValue32`.
+    /// The Source 2 schema defines 6=paint kit, 7=seed, 8=wear; relying on
+    /// this definition rather than vector order also survives absent attrs.
+    pub fn econ_attributes(&self, entity_id: i32) -> Vec<(u32, Variant)> {
+        let Some(Some(entity)) = self.entities.get(entity_id as usize) else {
+            return Vec::new();
+        };
+        Self::econ_attributes_from_props(&entity.props)
+    }
+
+    fn econ_attributes_from_props(props: &ahash::AHashMap<u32, Variant>) -> Vec<(u32, Variant)> {
+        const MAX_ECON_ATTRIBUTE_SLOTS: u32 = 64;
+        // An absent/malformed length is not permission to scan stale flattened
+        // baseline storage. Valid network vector lengths decode as U32.
+        let Some(Variant::U32(count)) = props.get(&ECON_ATTRIBUTE_COUNT_ID) else {
+            return Vec::new();
+        };
+        let mut attrs = Vec::new();
+        for slot in 0..(*count).min(MAX_ECON_ATTRIBUTE_SLOTS) {
+            let def = props.get(&(ECON_ATTRIBUTE_DEF_INDEX_BASE + slot));
+            let raw = props.get(&(ECON_ATTRIBUTE_RAW_VALUE_BASE + slot));
+            if let (Some(def), Some(raw)) = (def, raw) {
+                if let Some(definition) = variant_u32(def) {
+                    attrs.push((definition, raw.clone()));
+                }
+            }
+        }
+        attrs
+    }
+
+    fn active_weapon_cosmetics(&self, player_entity_id: i32) -> Option<ActiveWeaponCosmetics> {
+        let weapon = self.active_weapon_entity(player_entity_id)?;
+        let attributes = self.econ_attributes(weapon);
+        let attribute = |definition| attributes.iter().find_map(|(def, raw)| (*def == definition).then_some(raw));
+        Some(ActiveWeaponCosmetics {
+            paint: attribute(6).and_then(variant_numeric_u32),
+            seed: attribute(7).and_then(variant_numeric_u32),
+            wear: attribute(8).and_then(variant_f32),
+            stickers: Self::stickers_from_econ_attributes(&attributes),
+            keychain: Self::keychain_from_econ_attributes(&attributes),
+        })
+    }
+
+    fn keychain_from_econ_attributes(attributes: &[(u32, Variant)]) -> Vec<u32> {
+        let attribute = |definition| attributes.iter().find_map(|(def, raw)| (*def == definition).then_some(raw));
+        let Some(id) = attribute(299).and_then(variant_raw_u32).filter(|id| *id != 0) else {
+            return Vec::new();
+        };
+        let optional = [300, 301, 302, 306, 314, 321, 322].map(|definition| attribute(definition).and_then(variant_raw_u32));
+        let mut mask = 0u32;
+        let mut packed = vec![id, 0];
+        for (bit, value) in optional.into_iter().enumerate() {
+            if let Some(value) = value {
+                mask |= 1 << bit;
+                packed.push(value);
+            } else {
+                packed.push(0);
+            }
+        }
+        packed[1] = mask;
+        packed
+    }
+
+    fn econ_attribute(&self, entity_id: i32, definition: u32) -> Option<Variant> {
+        self.econ_attributes(entity_id)
+            .into_iter()
+            .find_map(|(def, raw)| (def == definition).then_some(raw))
+    }
+
+    fn collect_weapon_entity_snapshots(&mut self) {
+        let snapshots: Vec<_> = self
+            .entities
+            .iter()
+            .filter_map(|entry| {
+                let entity = entry.as_ref()?;
+                self.snapshot_weapon_entity(entity)
+            })
+            .collect();
+        self.weapon_entity_snapshots.extend(snapshots);
+    }
+
+    pub(crate) fn snapshot_weapon_entity(&self, entity: &Entity) -> Option<WeaponEntitySnapshot> {
+        let class = self.cls_by_id.get(entity.cls_id as usize)?;
+        let item_def = self.named_u32(entity.entity_id, "m_iItemDefinitionIndex");
+        // m_iItemDefinitionIndex is an unambiguous weapon/inventory marker;
+        // it deliberately excludes player pawns and arbitrary props.
+        item_def?;
+        let econ_attributes = self.econ_attributes(entity.entity_id);
+        let attribute = |definition| econ_attributes.iter().find_map(|(def, value)| (*def == definition).then_some(value));
+        let paint = attribute(6).and_then(|v| variant_u32(v));
+        let seed = attribute(7).and_then(|v| variant_numeric_u32(v));
+        let wear = attribute(8).and_then(|v| variant_f32(v));
+        let stickers = Self::stickers_from_econ_attributes(&econ_attributes);
+        let owner_handle = self.named_u32(entity.entity_id, "m_hOwnerEntity");
+        let owner_entity = owner_handle.map(handle_entity_index);
+        let owner = owner_entity.and_then(|owner_entity| self.players.values().find(|player| player.player_entity_id == Some(owner_entity)));
+        let owner_steamid = owner.and_then(|player| player.steamid);
+        let active = owner.and_then(|player| {
+            let pawn = player.player_entity_id?;
+            Some(self.active_weapon_entity(pawn) == Some(entity.entity_id))
+        });
+        Some(WeaponEntitySnapshot {
+            tick: self.tick,
+            source_order: (self.current_demo_frame_offset << 16) | u64::from(self.current_network_message_index),
+            entity_id: entity.entity_id,
+            entity_serial: entity.serial,
+            class_name: class.name.clone(),
+            item_id_high: self.named_u32(entity.entity_id, "m_iItemIDHigh"),
+            item_id_low: self.named_u32(entity.entity_id, "m_iItemIDLow"),
+            item_definition_index: item_def,
+            paint_kit_id: paint,
+            paint_seed: seed,
+            wear,
+            econ_attributes: econ_attributes
+                .into_iter()
+                .map(|(definition_index, raw_value)| EconAttribute { definition_index, raw_value })
+                .collect(),
+            stickers,
+            current_owner_handle: owner_handle,
+            owner_steamid,
+            inventory_slot: owner_entity.and_then(|pawn| self.weapon_inventory_slot(pawn, entity.entity_id)),
+            econ_inventory_position: self.named_i32(entity.entity_id, "m_iInventoryPosition"),
+            active,
+            clip_ammo: self.named_i32(entity.entity_id, "m_iClip1"),
+            reserve_ammo: self.named_i32(entity.entity_id, "m_pReserveAmmo"),
+            position: self.weapon_world_position(entity.entity_id),
+            rotation: self.named_xyz(entity.entity_id, "CBodyComponentBaseAnimGraph.m_angRotation"),
+            pvs_state: entity.pvs_state,
+            current_owner_id: self.named_u32(entity.entity_id, "m_nOwnerId"),
+            previous_owner_handle: self.named_u32(entity.entity_id, "m_hPrevOwner"),
+            original_owner_xuid_low: self.named_u32(entity.entity_id, "m_OriginalOwnerXuidLow"),
+            original_owner_xuid_high: self.named_u32(entity.entity_id, "m_OriginalOwnerXuidHigh"),
+            dropped_at_time: self.named_f32(entity.entity_id, "m_flDroppedAtTime"),
+            last_shake_time: self.named_f32(entity.entity_id, "m_flLastShakeTime"),
+            present: true,
+        })
+    }
+
+    fn weapon_inventory_slot(&self, pawn_entity_id: i32, weapon_entity_id: i32) -> Option<i32> {
+        let count = match self.get_prop_from_ent(&(MY_WEAPONS_OFFSET as u32), &pawn_entity_id).ok()? {
+            Variant::U32(value) => value,
+            _ => return None,
+        };
+        for ordinal in 0..count {
+            let prop_id = MY_WEAPONS_OFFSET as u32 + ordinal + 1;
+            if let Ok(Variant::U32(handle)) = self.get_prop_from_ent(&prop_id, &pawn_entity_id) {
+                if handle_entity_index(handle) == weapon_entity_id {
+                    return i32::try_from(ordinal).ok();
+                }
+            }
+        }
+        None
+    }
+
+    fn named_prop(&self, entity_id: i32, name: &str) -> Option<Variant> {
+        let id = self.prop_controller.name_to_id.get(name)?;
+        self.get_prop_from_ent(id, &entity_id).ok()
+    }
+    fn named_u32(&self, entity_id: i32, name: &str) -> Option<u32> {
+        self.named_prop(entity_id, name).and_then(|v| variant_u32(&v))
+    }
+    fn named_f32(&self, entity_id: i32, name: &str) -> Option<f32> {
+        self.named_prop(entity_id, name).and_then(|v| variant_f32(&v))
+    }
+    fn named_i32(&self, entity_id: i32, name: &str) -> Option<i32> {
+        self.named_prop(entity_id, name).and_then(|v| variant_i32(&v))
+    }
+    fn named_xyz(&self, entity_id: i32, name: &str) -> Option<[f32; 3]> {
+        match self.named_prop(entity_id, name)? {
+            Variant::VecXYZ(value) if value.iter().all(|v| v.is_finite()) => Some(value),
+            _ => None,
+        }
+    }
+    fn weapon_world_position(&self, entity_id: i32) -> Option<[f32; 3]> {
+        let coordinate = |cell_name: &str, offset_name: &str| {
+            coord_from_cell(
+                self.named_prop(entity_id, cell_name).ok_or(PropCollectionError::GetPropFromEntPropNotFound),
+                self.named_prop(entity_id, offset_name).ok_or(PropCollectionError::GetPropFromEntPropNotFound),
+            )
+            .ok()
+        };
+        Some([
+            coordinate("CBodyComponentBaseAnimGraph.m_cellX", "CBodyComponentBaseAnimGraph.m_vecX")?,
+            coordinate("CBodyComponentBaseAnimGraph.m_cellY", "CBodyComponentBaseAnimGraph.m_vecY")?,
+            coordinate("CBodyComponentBaseAnimGraph.m_cellZ", "CBodyComponentBaseAnimGraph.m_vecZ")?,
+        ])
     }
     fn create_tick(&self) -> Result<Variant, PropCollectionError> {
         // This can't actually fail
@@ -205,14 +498,11 @@ impl<'a> SecondPassParser<'a> {
             }
         }
 
-        self.get_prop_from_ent(&USERCMD_BUTTONSTATE_1, entity_id)
-            .ok()
-            .and_then(|value| match value {
-                Variant::U64(button_mask) => Some(button_mask),
-                _ => None,
-            })
+        self.get_prop_from_ent(&USERCMD_BUTTONSTATE_1, entity_id).ok().and_then(|value| match value {
+            Variant::U64(button_mask) => Some(button_mask),
+            _ => None,
+        })
     }
-
     fn get_button_prop_cached(
         &self,
         prop_info: &PropInfo,
@@ -238,9 +528,7 @@ impl<'a> SecondPassParser<'a> {
     }
     pub fn get_controller_prop(&self, prop_id: &u32, player: &PlayerMetaData) -> Result<Variant, PropCollectionError> {
         match player.controller_entid {
-            Some(entid) => {
-                return self.get_prop_from_ent(prop_id, &entid)
-            },
+            Some(entid) => return self.get_prop_from_ent(prop_id, &entid),
             None => return Err(PropCollectionError::ControllerEntityIdNotSet),
         }
     }
@@ -290,8 +578,14 @@ impl<'a> SecondPassParser<'a> {
 
     pub fn collect_projectiles(&mut self) {
         for projectile_entid in &self.projectiles {
-            let grenade_type = match self.find_grenade_type(projectile_entid) {              
-                Some(t) => {if !t.contains("Projectile") && !self.parse_grenades{continue}else{t}},
+            let grenade_type = match self.find_grenade_type(projectile_entid) {
+                Some(t) => {
+                    if !t.contains("Projectile") && !self.parse_grenades {
+                        continue;
+                    } else {
+                        t
+                    }
+                }
                 None => continue,
             };
             let steamid = match self.find_thrower_steamid(projectile_entid) {
@@ -489,11 +783,16 @@ impl<'a> SecondPassParser<'a> {
             WEAPON_PAINT_SEED => self.find_skin_paint_seed(player),
             WEAPON_FLOAT => self.find_skin_float(player),
             WEAPON_STICKERS_ID => self.find_stickers_from_active_weapon(player),
+            WEAPON_KEYCHAIN_ID => self.find_keychain_from_active_weapon(player),
             WEAPON_ORIGINGAL_OWNER_ID => self.find_weapon_original_owner(entity_id),
             INVENTORY_ID => self.find_my_inventory(entity_id),
             INVENTORY_AS_IDS_ID => self.find_my_inventory_as_ids(entity_id),
             INVENTORY_AS_IDS_BITMASK => self.find_my_inventory_as_bitmask(entity_id),
             ENTITY_ID_ID => Ok(Variant::I32(*entity_id)),
+            GRENADE_TYPE_ID => self.find_grenade_type(entity_id)
+                .filter(|_| self.projectiles.contains(entity_id))
+                .map(Variant::String)
+                .ok_or(PropCollectionError::UnknownCustomPropName),
             IS_ALIVE_ID => self.find_is_alive(entity_id),
             USERID_ID => self.get_userid(player),
             IS_AIRBORNE_ID => self.find_is_airborne(player),
@@ -542,7 +841,11 @@ impl<'a> SecondPassParser<'a> {
     }
     pub fn find_skin_float(&self, player: &PlayerMetaData) -> Result<Variant, PropCollectionError> {
         if let Some(player_entity_id) = &player.player_entity_id {
-            return self.find_weapon_prop(&WEAPON_FLOAT, &player_entity_id);
+            if let Some(weapon) = self.active_weapon_entity(*player_entity_id) {
+                if let Some(wear) = self.econ_attribute(weapon, 8).and_then(|v| variant_f32(&v)) {
+                    return Ok(Variant::F32(wear));
+                }
+            }
         }
         Err(PropCollectionError::PlayerNotFound)
     }
@@ -566,39 +869,57 @@ impl<'a> SecondPassParser<'a> {
     }
 
     pub fn find_stickers(&self, weapon_entity_id: &i32) -> Result<Variant, PropCollectionError> {
-        let mut stickers = vec![];
-        // indicies 0..4 info about skin. 4..24 info about stickers. 5 MAX STICKERS (4 idx per sticker),
-        for idx in (4..25).step_by(4) {
-            let sticker_id_id = WEAPON_SKIN_ID + idx;
-            let sticker_wear_id = WEAPON_SKIN_ID + idx + 1;
-            let sticker_x = WEAPON_SKIN_ID + idx + 2;
-            let sticker_y = WEAPON_SKIN_ID + idx + 3;
-            if let Some(sticker) = self.find_sticker(weapon_entity_id, sticker_id_id, sticker_wear_id, sticker_x, sticker_y) {
-                stickers.push(sticker);
-            }
-        }
-        return Ok(Variant::Stickers(stickers));
+        Ok(Variant::Stickers(self.find_stickers_typed(*weapon_entity_id)))
     }
-    fn find_sticker(&self, entity_id: &i32, sticker_id_id: u32, sticker_wear_id: u32, sticker_x: u32, sticker_y: u32) -> Option<Sticker> {
-        let id = self.get_prop_from_ent(&sticker_id_id, entity_id);
-        let wear = self.get_prop_from_ent(&sticker_wear_id, entity_id);
-        let sticker_x = self.get_prop_from_ent(&sticker_x, entity_id);
-        let sticker_y = self.get_prop_from_ent(&sticker_y, entity_id);
-        if let (Ok(Variant::F32(id)), Ok(Variant::F32(wear)), Ok(Variant::F32(sticker_x)), Ok(Variant::F32(sticker_y))) = (id, wear, sticker_x, sticker_y) {
-            return Some(Sticker {
-                id: id.to_bits(),
-                name: STICKER_ID_TO_NAME.get(&id.to_bits()).unwrap_or(&"unknown").to_string(),
-                wear: if wear < 0.0000000 { 0.0 } else { wear },
-                x: sticker_x,
-                y: sticker_y,
+    pub fn find_keychain_from_active_weapon(&self, player: &PlayerMetaData) -> Result<Variant, PropCollectionError> {
+        let weapon = player
+            .player_entity_id
+            .and_then(|pawn| self.active_weapon_entity(pawn))
+            .ok_or(PropCollectionError::PlayerNotFound)?;
+        Ok(Variant::U32Vec(Self::keychain_from_econ_attributes(&self.econ_attributes(weapon))))
+    }
+    fn find_stickers_typed(&self, entity_id: i32) -> Vec<Sticker> {
+        let attributes = self.econ_attributes(entity_id);
+        Self::stickers_from_econ_attributes(&attributes)
+    }
+
+    fn stickers_from_econ_attributes(attributes: &[(u32, Variant)]) -> Vec<Sticker> {
+        let attribute = |definition| attributes.iter().find_map(|(def, raw)| (*def == definition).then_some(raw));
+        let mut stickers = Vec::new();
+        // items_game defines six 4-attribute sticker slots beginning at 113:
+        // id, wear, scale and rotation. Placement offsets and schema are stored
+        // in the independent 278..=295 ranges.
+        for slot in 0..6u32 {
+            let base = 113 + slot * 4;
+            let Some(id) = attribute(base).and_then(variant_raw_u32) else {
+                continue;
+            };
+            if id == 0 {
+                continue;
+            }
+            let wear = attribute(base + 1).and_then(variant_f32);
+            let scale = attribute(base + 2).and_then(variant_f32);
+            let rotation = attribute(base + 3).and_then(variant_f32);
+            stickers.push(Sticker {
+                id,
+                name: STICKER_ID_TO_NAME.get(&id).unwrap_or(&"unknown").to_string(),
+                wear,
+                slot,
+                scale,
+                rotation,
+                offset_x: attribute(278 + slot * 2).and_then(variant_f32),
+                offset_y: attribute(279 + slot * 2).and_then(variant_f32),
+                schema: attribute(290 + slot).and_then(variant_raw_u32),
             });
         }
-        None
+        stickers
     }
     pub fn find_skin_paint_seed(&self, player: &PlayerMetaData) -> Result<Variant, PropCollectionError> {
         if let Some(player_entity_id) = &player.player_entity_id {
-            if let Ok(Variant::F32(f)) = self.find_weapon_prop(&WEAPON_PAINT_SEED, &player_entity_id) {
-                return Ok(Variant::U32(f as u32));
+            if let Some(weapon) = self.active_weapon_entity(*player_entity_id) {
+                if let Some(seed) = self.econ_attribute(weapon, 7).and_then(|v| variant_numeric_u32(&v)) {
+                    return Ok(Variant::U32(seed));
+                }
             }
         }
         return Ok(Variant::U32(0));
@@ -706,11 +1027,7 @@ impl<'a> SecondPassParser<'a> {
     ) -> Result<Variant, PropCollectionError> {
         self.collect_velocity_axis(player, axis)
     }
-    fn cached_velocity_indicies<'b>(
-        &self,
-        player: &PlayerMetaData,
-        indicies_cache: &'b mut Option<Vec<usize>>,
-    ) -> Result<&'b [usize], PropCollectionError> {
+    fn cached_velocity_indicies<'b>(&self, player: &PlayerMetaData, indicies_cache: &'b mut Option<Vec<usize>>) -> Result<&'b [usize], PropCollectionError> {
         if indicies_cache.is_none() {
             let steamid = player.steamid.ok_or(PropCollectionError::PlayerNotFound)?;
             *indicies_cache = Some(self.find_wanted_indicies(self.output.get(&STEAMID_ID), steamid));
@@ -1041,22 +1358,14 @@ impl<'a> SecondPassParser<'a> {
     }
 
     pub fn find_weapon_skin(&self, weapon_entity_id: &i32) -> Result<Variant, PropCollectionError> {
-        match self.get_prop_from_ent(&WEAPON_SKIN_ID, weapon_entity_id) {
-            Ok(Variant::F32(f)) => {
-                // The value is stored as a float for some reason
-                if f.fract() == 0.0 && f >= 0.0 {
-                    let idx = f as u32;
-                    match PAINTKITS.get(&idx) {
-                        Some(kit) => Ok(Variant::String(kit.to_string())),
-                        None => Err(PropCollectionError::WeaponSkinNoSkinMapping),
-                    }
-                } else {
-                    return Err(PropCollectionError::WeaponSkinFloatConvertionError);
-                }
-            }
-            Ok(_) => return Err(PropCollectionError::WeaponSkinIdxIncorrectVariant),
-            Err(e) => return Err(e),
-        }
+        let idx = self
+            .econ_attribute(*weapon_entity_id, 6)
+            .and_then(|v| variant_numeric_u32(&v))
+            .ok_or(PropCollectionError::WeaponSkinIdxIncorrectVariant)?;
+        PAINTKITS
+            .get(&idx)
+            .map(|kit| Variant::String(kit.to_string()))
+            .ok_or(PropCollectionError::WeaponSkinNoSkinMapping)
     }
     pub fn find_weapon_skin_id_from_player(&self, player_entid: &i32) -> Result<Variant, PropCollectionError> {
         let p = match self.prop_controller.special_ids.active_weapon {
@@ -1072,19 +1381,18 @@ impl<'a> SecondPassParser<'a> {
             Err(e) => Err(e),
         };
     }
-    pub fn find_weapon_skin_id(&self, weapon_entity_id: &i32) -> Result<Variant, PropCollectionError> {
-        match self.get_prop_from_ent(&WEAPON_SKIN_ID, weapon_entity_id) {
-            Ok(Variant::F32(f)) => {
-                // The value is stored as a float for some reason
-                if f.fract() == 0.0 && f >= 0.0 {
-                    return Ok(Variant::U32(f as u32));
-                } else {
-                    return Err(PropCollectionError::WeaponSkinFloatConvertionError);
-                }
-            }
-            Ok(_) => return Err(PropCollectionError::WeaponSkinIdxIncorrectVariant),
-            Err(e) => return Err(e),
+    pub(crate) fn active_weapon_entity(&self, player_entid: i32) -> Option<i32> {
+        let prop = self.prop_controller.special_ids.active_weapon?;
+        match self.get_prop_from_ent(&prop, &player_entid).ok()? {
+            Variant::U32(handle) => Some(handle_entity_index(handle)),
+            _ => None,
         }
+    }
+    pub fn find_weapon_skin_id(&self, weapon_entity_id: &i32) -> Result<Variant, PropCollectionError> {
+        self.econ_attribute(*weapon_entity_id, 6)
+            .and_then(|v| variant_numeric_u32(&v))
+            .map(Variant::U32)
+            .ok_or(PropCollectionError::WeaponSkinIdxIncorrectVariant)
     }
     pub fn find_weapon_skin_from_player(&self, player_entid: &i32) -> Result<Variant, PropCollectionError> {
         let p = match self.prop_controller.special_ids.active_weapon {
@@ -1101,51 +1409,35 @@ impl<'a> SecondPassParser<'a> {
         };
     }
     pub fn find_glove_skin_id(&self, player_entid: &i32) -> Result<Variant, PropCollectionError> {
-        match self.get_prop_from_ent(&GLOVE_PAINT_ID, player_entid) {
-            Ok(Variant::F32(f)) => {
-                // The value is stored as a float for some reason
-                if f.fract() == 0.0 && f >= 0.0 {
-                    return Ok(Variant::U32(f as u32));
-                } else {
-                    return Err(PropCollectionError::GloveSkinFloatConvertionError);
-                }
-            }
-            Ok(_) => return Err(PropCollectionError::GloveSkinIdxIncorrectVariant),
-            Err(e) => return Err(e),
-        }
+        self.econ_attribute(*player_entid, 6)
+            .and_then(|v| variant_u32(&v))
+            .map(Variant::U32)
+            .ok_or(PropCollectionError::GloveSkinIdxIncorrectVariant)
     }
 
     pub fn find_glove_skin(&self, player_entid: &i32) -> Result<Variant, PropCollectionError> {
-        match self.get_prop_from_ent(&GLOVE_PAINT_ID, player_entid) {
-            Ok(Variant::F32(f)) => {
-                // The value is stored as a float for some reason
-                if f.fract() == 0.0 && f >= 0.0 {
-                    let idx = f as u32;
-                    match PAINTKITS.get(&idx) {
-                        Some(kit) => Ok(Variant::String(kit.to_string())),
-                        None => Err(PropCollectionError::GloveSkinNoSkinMapping),
-                    }
-                } else {
-                    return Err(PropCollectionError::GloveSkinFloatConvertionError);
-                }
-            }
-            Ok(_) => return Err(PropCollectionError::GloveSkinIdxIncorrectVariant),
-            Err(e) => return Err(e),
-        }
+        let idx = self
+            .econ_attribute(*player_entid, 6)
+            .and_then(|v| variant_u32(&v))
+            .ok_or(PropCollectionError::GloveSkinIdxIncorrectVariant)?;
+        PAINTKITS
+            .get(&idx)
+            .map(|kit| Variant::String(kit.to_string()))
+            .ok_or(PropCollectionError::GloveSkinNoSkinMapping)
     }
 
     pub fn find_glove_paint_seed(&self, player_entid: &i32) -> Result<Variant, PropCollectionError> {
-        match self.get_prop_from_ent(&GLOVE_PAINT_SEED, player_entid) {
-            Ok(p) => Ok(p),
-            Err(e) => return Err(e),
-        }
+        self.econ_attribute(*player_entid, 7)
+            .and_then(|v| variant_numeric_u32(&v))
+            .map(Variant::U32)
+            .ok_or(PropCollectionError::GloveSkinIdxIncorrectVariant)
     }
 
     pub fn find_glove_paint_float(&self, player_entid: &i32) -> Result<Variant, PropCollectionError> {
-        match self.get_prop_from_ent(&GLOVE_PAINT_FLOAT, player_entid) {
-            Ok(p) => Ok(p),
-            Err(e) => return Err(e),
-        }
+        self.econ_attribute(*player_entid, 8)
+            .and_then(|v| variant_f32(&v))
+            .map(Variant::F32)
+            .ok_or(PropCollectionError::GloveSkinIdxIncorrectVariant)
     }
 
     pub fn find_weapon_prop(&self, prop: &u32, player_entid: &i32) -> Result<Variant, PropCollectionError> {
@@ -1282,7 +1574,7 @@ impl<'a> SecondPassParser<'a> {
     }
 }
 
-fn coord_from_cell(cell: Result<Variant, PropCollectionError>, offset: Result<Variant, PropCollectionError>) -> Result<f32, PropCollectionError> {
+pub(super) fn coord_from_cell(cell: Result<Variant, PropCollectionError>, offset: Result<Variant, PropCollectionError>) -> Result<f32, PropCollectionError> {
     // Both cell and offset are needed for calculation
     match (offset, cell) {
         (Ok(Variant::F32(offset)), Ok(Variant::U32(cell))) => {
@@ -1365,5 +1657,131 @@ impl std::error::Error for PropCollectionError {}
 impl fmt::Display for PropCollectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+#[cfg(test)]
+mod cosmetic_attribute_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_econ_definition_diagnostic_tracks_last_live_update_without_losing_slots() {
+        use crate::first_pass::sendtables::FieldInfo;
+        use crate::second_pass::decoder::Decoder;
+        let mut entity = Entity { entity_id: 1, cls_id: 1, serial: 1,
+            props: Default::default(), entity_type: EntityType::Normal, pvs_state: None };
+        let info = |prop_id| Some(FieldInfo { decoder: Decoder::UnsignedDecoder, should_parse: true, prop_id });
+        SecondPassParser::insert_field(&mut entity, Variant::U32(3), info(ECON_ATTRIBUTE_COUNT_ID));
+        SecondPassParser::insert_field(&mut entity, Variant::U32(121), info(ECON_ATTRIBUTE_DEF_INDEX_BASE + 2));
+        SecondPassParser::insert_field(&mut entity, Variant::U32(113), info(ECON_ATTRIBUTE_DEF_INDEX_BASE));
+        // Last decoded, not the numerically highest slot.
+        assert_eq!(entity.props.get(&ECON_ATTRIBUTE_LEGACY_DEF_ID), Some(&Variant::U32(113)));
+        assert_eq!(entity.props.get(&(ECON_ATTRIBUTE_DEF_INDEX_BASE + 2)), Some(&Variant::U32(121)));
+        SecondPassParser::insert_field(&mut entity, Variant::U32(1), info(ECON_ATTRIBUTE_COUNT_ID));
+        assert_eq!(entity.props.get(&ECON_ATTRIBUTE_LEGACY_DEF_ID), Some(&Variant::U32(113)));
+        SecondPassParser::insert_field(&mut entity, Variant::U32(0), info(ECON_ATTRIBUTE_COUNT_ID));
+        assert!(!entity.props.contains_key(&ECON_ATTRIBUTE_LEGACY_DEF_ID));
+        assert!(!entity.props.contains_key(&ECON_ATTRIBUTE_LEGACY_DEF_SLOT_ID));
+        SecondPassParser::insert_field(&mut entity, Variant::U32(3), info(ECON_ATTRIBUTE_COUNT_ID));
+        assert!(!entity.props.contains_key(&ECON_ATTRIBUTE_LEGACY_DEF_ID));
+        SecondPassParser::insert_field(&mut entity, Variant::U32(121), info(ECON_ATTRIBUTE_DEF_INDEX_BASE + 2));
+        SecondPassParser::insert_field(&mut entity, Variant::U32(1), info(ECON_ATTRIBUTE_COUNT_ID));
+        assert!(!entity.props.contains_key(&ECON_ATTRIBUTE_LEGACY_DEF_ID),
+            "a nonzero shrink must also clear a diagnostic whose element was removed");
+    }
+
+    #[test]
+    fn econ_vector_shrink_27_to_7_removes_baseline_holo_stickers() {
+        use crate::first_pass::sendtables::FieldInfo;
+        use crate::second_pass::decoder::Decoder;
+        let mut entity = Entity { entity_id: 261, cls_id: 193, serial: 164,
+            props: Default::default(), entity_type: EntityType::Normal, pvs_state: Some(0) };
+        let count_info = Some(FieldInfo { decoder: Decoder::UnsignedDecoder,
+            should_parse: true, prop_id: ECON_ATTRIBUTE_COUNT_ID });
+        SecondPassParser::insert_field(&mut entity, Variant::U32(27), count_info);
+        // The received seven slots, plus the real stale baseline sticker-id slots.
+        for (slot, def, value) in [
+            (0, 6, 1334.0), (1, 7, 986.0961), (2, 8, 0.07741249),
+            (3, 113, f32::from_bits(9517)), (4, 278, -0.39064178),
+            (5, 279, -0.011177272), (6, 290, 0.0),
+            (7, 121, f32::from_bits(6694)), (9, 125, f32::from_bits(6694)),
+            (26, 293, f32::from_bits(4)),
+        ] {
+            entity.props.insert(ECON_ATTRIBUTE_DEF_INDEX_BASE + slot, Variant::U32(def));
+            entity.props.insert(ECON_ATTRIBUTE_RAW_VALUE_BASE + slot, Variant::F32(value));
+        }
+        assert_eq!(SecondPassParser::stickers_from_econ_attributes(
+            &SecondPassParser::econ_attributes_from_props(&entity.props)).len(), 3);
+        SecondPassParser::insert_field(&mut entity, Variant::U32(7), count_info);
+        let attributes = SecondPassParser::econ_attributes_from_props(&entity.props);
+        assert_eq!(attributes.len(), 7);
+        let stickers = SecondPassParser::stickers_from_econ_attributes(&attributes);
+        assert_eq!(stickers.len(), 1);
+        assert_eq!(stickers[0].id, 9517);
+        assert_eq!(stickers[0].offset_x, Some(-0.39064178));
+        assert!(!entity.props.contains_key(&(ECON_ATTRIBUTE_DEF_INDEX_BASE + 7)));
+        assert!(!entity.props.contains_key(&(ECON_ATTRIBUTE_RAW_VALUE_BASE + 26)));
+        SecondPassParser::insert_field(&mut entity, Variant::U32(27), count_info);
+        assert_eq!(SecondPassParser::econ_attributes_from_props(&entity.props).len(), 7,
+            "regrowth must not resurrect removed baseline attributes");
+        SecondPassParser::insert_field(&mut entity, Variant::U32(0), count_info);
+        assert!(SecondPassParser::econ_attributes_from_props(&entity.props).is_empty());
+    }
+
+    #[test]
+    fn econ_attributes_require_a_valid_vector_length() {
+        let mut props = ahash::AHashMap::default();
+        props.insert(ECON_ATTRIBUTE_DEF_INDEX_BASE, Variant::U32(113));
+        props.insert(ECON_ATTRIBUTE_RAW_VALUE_BASE, Variant::F32(f32::from_bits(9517)));
+        assert!(SecondPassParser::econ_attributes_from_props(&props).is_empty());
+        props.insert(ECON_ATTRIBUTE_COUNT_ID, Variant::F32(1.0));
+        assert!(SecondPassParser::econ_attributes_from_props(&props).is_empty());
+        props.insert(ECON_ATTRIBUTE_COUNT_ID, Variant::U32(1));
+        assert_eq!(SecondPassParser::econ_attributes_from_props(&props).len(), 1);
+    }
+
+    #[test]
+    fn sticker_fields_follow_items_game_definitions() {
+        let attributes = vec![
+            (113, Variant::F32(f32::from_bits(477))),
+            (114, Variant::F32(0.25)),
+            (115, Variant::F32(0.75)),
+            (116, Variant::F32(12.5)),
+            (278, Variant::F32(-0.2)),
+            (279, Variant::F32(0.3)),
+            (290, Variant::F32(f32::from_bits(2))),
+        ];
+
+        let sticker = SecondPassParser::stickers_from_econ_attributes(&attributes)
+            .into_iter()
+            .next()
+            .expect("slot zero sticker");
+        assert_eq!(sticker.id, 477);
+        assert_eq!(sticker.slot, 0);
+        assert_eq!(sticker.wear, Some(0.25));
+        assert_eq!(sticker.scale, Some(0.75));
+        assert_eq!(sticker.rotation, Some(12.5));
+        assert_eq!(sticker.offset_x, Some(-0.2));
+        assert_eq!(sticker.offset_y, Some(0.3));
+        assert_eq!(sticker.schema, Some(2));
+    }
+
+    #[test]
+    fn keychain_fields_preserve_raw_integer_bits_and_float_offsets() {
+        let attributes = vec![
+            (299, Variant::F32(f32::from_bits(8))),
+            (300, Variant::F32(19.0)),
+            (301, Variant::F32(0.5)),
+            (302, Variant::F32(3.5)),
+            (306, Variant::F32(f32::from_bits(63_941))),
+        ];
+
+        let packed = SecondPassParser::keychain_from_econ_attributes(&attributes);
+        assert_eq!(packed[0], 8);
+        assert_eq!(packed[1], 0b000_1111);
+        assert_eq!(f32::from_bits(packed[2]), 19.0);
+        assert_eq!(f32::from_bits(packed[3]), 0.5);
+        assert_eq!(f32::from_bits(packed[4]), 3.5);
+        assert_eq!(packed[5], 63_941);
     }
 }

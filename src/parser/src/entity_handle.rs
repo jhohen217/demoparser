@@ -82,6 +82,8 @@ mod tests {
         let controller_id = 4097;
         let weapon_id = 5000;
         parser.entities[weapon_id] = Some(Entity {
+                serial: 0,
+                pvs_state: None,
             cls_id: 0,
             entity_id: weapon_id as i32,
             props: [(7, Variant::U32(30))].into_iter().collect(),
@@ -90,6 +92,8 @@ mod tests {
         for (handle, pawn_id) in [(4_361_079, 2935), (6_275_616, 544), (0x47FF, 2047), (0x7FFF, 16383)] {
             parser.players.clear();
             parser.entities[controller_id] = Some(Entity {
+                serial: 0,
+                pvs_state: None,
                 cls_id: 0,
                 entity_id: controller_id as i32,
                 props: [
@@ -102,6 +106,8 @@ mod tests {
                 entity_type: EntityType::PlayerController,
             });
             parser.entities[pawn_id as usize] = Some(Entity {
+                serial: 0,
+                pvs_state: None,
                 cls_id: 0,
                 entity_id: pawn_id,
                 props: [

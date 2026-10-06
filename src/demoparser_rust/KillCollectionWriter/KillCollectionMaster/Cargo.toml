@@ -1,0 +1,22 @@
+[package]
+name = "kill_collection_master"
+version = "0.1.0"
+edition = "2021"
+description = "Tool for managing master CSV files of kill collections from CS:GO demo files"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+csv = { workspace = true }
+chrono = { workspace = true }
+rayon = { workspace = true }
+indicatif = { workspace = true }
+interface = { path = "../../interface" }
+kill_collection_writer = { path = "../" }
+flate2 = "1.0"  # For gzip decompression
+zstd = "0.13"   # For zstd decompression
+duckdb = { version = "1.1", features = ["bundled"] }  # For DuckDB database files with bundled library
+dashmap = "5.5.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }

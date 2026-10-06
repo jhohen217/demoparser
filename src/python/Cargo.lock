@@ -304,7 +304,6 @@ dependencies = [
  "ahash",
  "csgoproto",
  "derive_more",
- "ethnum",
  "itertools 0.13.0",
  "memmap2 0.9.9",
  "parser",
@@ -809,6 +808,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde",
+ "serde_json",
  "snap",
 ]
 

@@ -1,0 +1,21 @@
+[package]
+name = "kill_collection_writer"
+version = "0.1.0"
+edition = "2021"
+description = "Tool for writing kill collections from CS:GO demo files to CSV files"
+
+# Disable building the binary by default
+[[bin]]
+name = "kill_collection_writer"
+path = "src/main.rs"
+required-features = ["build-binary"]
+
+[features]
+build-binary = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+csv = { workspace = true }
+chrono = { workspace = true }
+interface = { path = "../interface" }

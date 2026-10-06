@@ -2,11 +2,14 @@ use super::read_bits::Bitreader;
 use super::read_bits::DemoParserError;
 use crate::first_pass::parser_settings::needs_velocity;
 use crate::first_pass::parser_settings::FirstPassParser;
-use crate::first_pass::prop_controller::FLASHBANG_AMMO_ID;
-use crate::first_pass::prop_controller::GRENADE_AMMO_ID;
 use crate::first_pass::prop_controller::PropController;
+use crate::first_pass::prop_controller::ECON_ATTRIBUTE_DEF_INDEX_BASE;
+use crate::first_pass::prop_controller::ECON_ATTRIBUTE_RAW_VALUE_BASE;
+use crate::first_pass::prop_controller::ECON_ATTRIBUTE_COUNT_ID;
+use crate::first_pass::prop_controller::FLASHBANG_AMMO_ID;
 use crate::first_pass::prop_controller::FLATTENED_VEC_MAX_LEN;
 use crate::first_pass::prop_controller::GLOVE_PAINT_ID;
+use crate::first_pass::prop_controller::GRENADE_AMMO_ID;
 use crate::first_pass::prop_controller::ITEM_PURCHASE_COST;
 use crate::first_pass::prop_controller::ITEM_PURCHASE_COUNT;
 use crate::first_pass::prop_controller::ITEM_PURCHASE_DEF_IDX;
@@ -366,7 +369,7 @@ impl ValueField {
     }
 }
 impl VectorField {
-    pub fn new(field_enum: Field, f: std::option::Option<Box<FieldType>>) -> VectorField {
+    pub fn new(field_enum: Field, _f: std::option::Option<Box<FieldType>>) -> VectorField {
         VectorField {
             field_enum: Box::new(field_enum),
             decoder: UnsignedDecoder,
@@ -474,6 +477,14 @@ pub fn get_propinfo(field: &Field, path: &FieldPath) -> Option<FieldInfo> {
             prop_id: v.prop_id,
         },
         Field::Vector(v) => match field.get_inner(0) {
+            // A vector of serializers otherwise returns None here and silently drops
+            // its length. Real MAC-10 creation shrinks a 27-attribute baseline to 7;
+            // retaining the tail invents two holo stickers that CS2 never renders.
+            Ok(Field::Serializer(inner)) if inner.serializer.name == "CEconItemAttribute" => FieldInfo {
+                decoder: v.decoder,
+                should_parse: true,
+                prop_id: ECON_ATTRIBUTE_COUNT_ID,
+            },
             Ok(Field::Value(inner)) => FieldInfo {
                 decoder: v.decoder,
                 should_parse: inner.should_parse,
@@ -499,8 +510,14 @@ pub fn get_propinfo(field: &Field, path: &FieldPath) -> Option<FieldInfo> {
     if fi.prop_id == GLOVE_PAINT_ID {
         fi.prop_id = GLOVE_PAINT_ID + path.path[1] as u32;
     }
+    if fi.prop_id == ECON_ATTRIBUTE_DEF_INDEX_BASE {
+        fi.prop_id = ECON_ATTRIBUTE_DEF_INDEX_BASE + path.path[1] as u32;
+    }
+    if fi.prop_id == ECON_ATTRIBUTE_RAW_VALUE_BASE {
+        fi.prop_id = ECON_ATTRIBUTE_RAW_VALUE_BASE + path.path[1] as u32;
+    }
     // index 14 seems to be for flashbang ammo...
-    if fi.prop_id == GRENADE_AMMO_ID && path.path[2] == 14{
+    if fi.prop_id == GRENADE_AMMO_ID && path.path[2] == 14 {
         fi.prop_id = FLASHBANG_AMMO_ID;
     }
 
@@ -528,7 +545,7 @@ fn create_field(
     _sid: &String,
     fd: &mut ConstructorField,
     serializers: &AHashMap<String, Serializer>,
-    qf_mapper: &mut QfMapper,
+    _qf_mapper: &mut QfMapper,
 ) -> Result<Field, DemoParserError> {
     let element_type = match fd.category {
         FieldCategory::Array => fd.field_type.element_type.clone(),
@@ -632,6 +649,7 @@ impl ConstructorField {
                     "VectorWS" => self.find_vector_type(3, qf_map),
                     "Vector4D" => self.find_vector_type(4, qf_map),
                     "uint64" => self.find_uint_decoder(),
+                    "ResourceId_t" => self.find_uint_decoder(),
                     "QAngle" => self.find_qangle_decoder(),
                     "CHandle" => UnsignedDecoder,
                     "CNetworkedQuantizedFloat" => self.find_float_decoder(qf_map),
@@ -788,4 +806,28 @@ pub struct FieldType {
     pub pointer: bool,
     pub count: Option<i32>,
     pub element_type: Option<Box<FieldType>>,
+}
+
+#[cfg(test)]
+mod econ_vector_length_tests {
+    use super::*;
+
+    #[test]
+    fn econ_serializer_vector_exposes_length_without_flattening_it_as_slot_zero() {
+        let serializer = Serializer { name: "CEconItemAttribute".to_owned(), fields: vec![] };
+        let field = Field::Vector(VectorField::new(Field::Serializer(SerializerField::new(&serializer)), None));
+        let path = FieldPath { path: [90, 0, 0, 0, 0, 0, 0], last: 0 };
+        let info = get_propinfo(&field, &path).expect("econ vector length is retained");
+        assert_eq!(info.prop_id, ECON_ATTRIBUTE_COUNT_ID);
+        assert!(info.should_parse);
+        assert!(matches!(info.decoder, UnsignedDecoder));
+    }
+
+    #[test]
+    fn unrelated_serializer_vector_does_not_overwrite_econ_length() {
+        let serializer = Serializer { name: "UnrelatedAttribute".to_owned(), fields: vec![] };
+        let field = Field::Vector(VectorField::new(Field::Serializer(SerializerField::new(&serializer)), None));
+        let path = FieldPath { path: [90, 0, 0, 0, 0, 0, 0], last: 0 };
+        assert!(get_propinfo(&field, &path).is_none());
+    }
 }

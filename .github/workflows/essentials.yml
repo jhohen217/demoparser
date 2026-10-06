@@ -1,0 +1,36 @@
+name: Parser and writer essentials
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            DemoWriter
+            src/demoparser_rust
+      - name: Writer library tests
+        working-directory: DemoWriter
+        run: cargo test --locked --all-targets
+      - name: Parser fixture-free tests
+        working-directory: src/parser
+        run: cargo test --locked --lib
+      - name: Build essential executables
+        run: python scripts/build.py
+      - name: Application library tests
+        working-directory: src/demoparser_rust
+        run: cargo test --locked --lib
+      - name: Downloader library tests
+        working-directory: src/demoparser_rust
+        run: cargo test --locked -p demofetch --lib
+      - name: Check integrated map command
+        run: |
+          ./out/Demoparser.exe retarget --help
+          ./out/Demoparser.exe --capabilities
+          if (Test-Path ./out/light-demo-probe.exe) { ./out/light-demo-probe.exe --help }

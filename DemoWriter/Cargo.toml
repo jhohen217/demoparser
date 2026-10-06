@@ -1,0 +1,50 @@
+[package]
+name = "demo-writer"
+autobins = false
+version = "0.1.0"
+edition = "2021"
+description = "Cut a single round or a contiguous range of rounds out of a CS2 demo"
+
+[[bin]]
+name = "demo-writer"
+path = "src/main.rs"
+
+[dependencies]
+parser = { path = "../src/parser" }
+csgoproto = { path = "../src/csgoproto" }
+prost = "0.13.3"
+snap = "1.1.0"
+memmap2 = "0.9.4"
+flate2 = "1.0"
+zstd = "0.13"
+ahash = "0.8.3"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rayon = "1.8"
+sha2 = "0.10"
+tempfile = "3"
+
+[profile.release]
+debug = true
+
+[[bin]]
+name = "schedule-entity-fields"
+path = "src/bin/schedule-entity-fields.rs"
+
+[[bin]]
+name = "checkpoint-insert-entities"
+path = "src/bin/checkpoint-insert-entities.rs"
+
+[[bin]]
+name = "audit-entity-fields"
+path = "src/bin/audit-entity-fields.rs"
+
+[[bin]]
+name = "inspect-entity-events"
+path = "src/bin/inspect-entity-events.rs"
+
+[[bin]]
+name = "light-demo-probe"
+path = "src/bin/light-demo-probe.rs"

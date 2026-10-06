@@ -38,6 +38,7 @@ pub const PLAYER_X_ID: u32 = 100000016;
 pub const PLAYER_Y_ID: u32 = 100000017;
 pub const PLAYER_Z_ID: u32 = 100000018;
 pub const WEAPON_STICKERS_ID: u32 = 100000019;
+pub const WEAPON_KEYCHAIN_ID: u32 = 100000020;
 
 pub const WEAPON_SKIN_ID: u32 = 10000000;
 pub const WEAPON_PAINT_SEED: u32 = 10000001;
@@ -53,6 +54,17 @@ pub const GLOVE_PAINT_ID: u32 = 20000000;
 pub const GLOVE_PAINT_SEED: u32 = 20000001;
 pub const GLOVE_PAINT_FLOAT: u32 = 20000002;
 pub const GLOVE_SKIN: u32 = 20000003;
+// Keep each CEconItemAttribute array slot addressable.  The old skin helpers
+// assumed slot order; these ids let the second pass pair a raw value with its
+// m_iAttributeDefinitionIndex before interpreting it.
+pub const ECON_ATTRIBUTE_DEF_INDEX_BASE: u32 = 21000000;
+pub const ECON_ATTRIBUTE_RAW_VALUE_BASE: u32 = 22000000;
+/// Current CEconItemAttribute vector length, including baseline/creation resizes.
+pub const ECON_ATTRIBUTE_COUNT_ID: u32 = 23000000;
+/// Legacy scalar diagnostic: last decoded definition index of a still-live element.
+/// Cosmetic reconstruction must use the per-slot definition/raw pairs instead.
+pub const ECON_ATTRIBUTE_LEGACY_DEF_ID: u32 = 24000000;
+pub const ECON_ATTRIBUTE_LEGACY_DEF_SLOT_ID: u32 = 25000000;
 
 pub const USERCMD_VIEWANGLE_X: u32 = 100000022;
 pub const USERCMD_VIEWANGLE_Y: u32 = 100000023;
@@ -116,6 +128,9 @@ pub struct PropController {
     pub wanted_prop_states: AHashMap<String, Variant>,
     pub wanted_prop_state_infos: Vec<WantedPropStateInfo>,
     pub parse_projectiles: bool,
+    /// Opt-in all-weapon entity snapshots. Kept opt-in because retaining every
+    /// entity at every packet is deliberately more expensive than player rows.
+    pub capture_weapon_entities: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +164,7 @@ impl PropController {
         wanted_events: &[String],
         parse_projectiles: bool,
     ) -> Self {
+        let capture_weapon_entities = wanted_player_props.iter().any(|name| name == "weapon_entity_snapshots");
         PropController {
             id: NORMAL_PROP_BASEID,
             wanted_player_props,
@@ -166,6 +182,7 @@ impl PropController {
             wanted_prop_states,
             wanted_prop_state_infos: vec![],
             parse_projectiles: parse_projectiles,
+            capture_weapon_entities,
         }
     }
 
@@ -295,7 +312,7 @@ impl PropController {
         if self.parse_projectiles {
             self.prop_infos.push(PropInfo {
                 id: GRENADE_TYPE_ID,
-                prop_type: PropType::Tick,
+                prop_type: PropType::Custom,
                 prop_name: "grenade_type".to_string(),
                 prop_friendly_name: "grenade_type".to_string(),
                 is_player_prop: true,
@@ -355,6 +372,15 @@ impl PropController {
         self.traverse_fields(&mut ser.fields, ser.name.clone(), vec![])
     }
     fn set_id(&mut self, weap_prop: &str, f: &mut ValueField, is_grenade_or_weapon: bool) {
+        if weap_prop == "CEconItemAttribute.m_iAttributeDefinitionIndex" {
+            // handle_prop later switches the wire field to per-slot storage.
+            // Keep the public scalar column mapped to its explicit diagnostic
+            // alias rather than an ordinary ID that is no longer populated.
+            self.name_to_id.insert(weap_prop.to_string(), ECON_ATTRIBUTE_LEGACY_DEF_ID);
+            self.id_to_name.insert(ECON_ATTRIBUTE_LEGACY_DEF_ID, weap_prop.to_string());
+            f.prop_id = ECON_ATTRIBUTE_LEGACY_DEF_ID;
+            return;
+        }
         match self.name_to_id.get(weap_prop) {
             // If we already have an id for prop of same name then use that id.
             // Mainly for weapon props. For example CAK47.m_iClip1 and CWeaponSCAR20.m_iClip1
@@ -484,13 +510,13 @@ impl PropController {
         if full_name == "CCSPlayerPawn.CCSPlayer_BuyServices.SellbackPurchaseEntry_t.m_hItem" {
             f.prop_id = ITEM_PURCHASE_HANDLE as u32;
         }
-        if !full_name.starts_with("CCSPlayerPawn") && prop_name.contains("CEconItemAttribute.m_iRawValue32") {
-            f.prop_id = WEAPON_SKIN_ID as u32;
+        if prop_name.contains("CEconItemAttribute.m_iAttributeDefinitionIndex") {
+            f.prop_id = ECON_ATTRIBUTE_DEF_INDEX_BASE;
         }
-        if full_name.starts_with("CCSPlayerPawn") && prop_name.contains("CEconItemAttribute.m_iRawValue32") {
-            f.prop_id = GLOVE_PAINT_ID as u32;
+        if prop_name.contains("CEconItemAttribute.m_iRawValue32") {
+            f.prop_id = ECON_ATTRIBUTE_RAW_VALUE_BASE;
         }
-        if full_name == "CCSPlayerPawn.CCSPlayer_WeaponServices.m_iAmmo"{
+        if full_name == "CCSPlayerPawn.CCSPlayer_WeaponServices.m_iAmmo" {
             f.prop_id = GRENADE_AMMO_ID;
         }
         self.id += 1;

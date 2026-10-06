@@ -1,14 +1,15 @@
-use std::{io::Result, process::Command};
+use std::{io, path::Path};
 
-fn main() -> Result<()> {
-    println!("cargo::rerun-if-changed=../csgoproto/src/protobuf.rs");
-    println!("cargo::rerun-if-changed=../csgoproto/GameTracking-CS2/game/csgo/pak01_dir/resource/csgo_english.txt");
-
-    let profile = std::env::var("PROFILE").unwrap_or("debug".to_string());
-    Command::new("cargo")
-        .current_dir("../csgoproto")
-        .args(["run", if profile == "release" { "--release" } else { "" }])
-        .status()?;
-
+fn main() -> io::Result<()> {
+    // Generated inputs belong to csgoproto. Building a consumer must never
+    // launch nested Cargo or rewrite another crate's source tree.
+    for name in ["protobuf.rs", "message_type.rs", "maps.rs"] {
+        let path = format!("../csgoproto/src/{name}");
+        println!("cargo::rerun-if-changed={path}");
+        if !Path::new(&path).is_file() {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                format!("Missing generated input {path}; see ../csgoproto/GENERATING.md")));
+        }
+    }
     Ok(())
 }

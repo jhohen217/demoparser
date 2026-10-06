@@ -1,0 +1,21 @@
+[package]
+name = "interface"
+version = "0.1.0"
+edition = "2021"
+description = "Interface for parsing CS:GO demo files and extracting kill collections"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+csv = { workspace = true }
+chrono = { workspace = true }
+parser = { path = "../../parser" }
+memmap2 = "0.9.5"
+ahash = "0.8.12"
+flate2 = { workspace = true }
+zstd = { workspace = true }
+dashmap = "5.5.3"
+once_cell = "1.19"
+
+[dev-dependencies]
+tempfile = { workspace = true }

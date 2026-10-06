@@ -21,6 +21,7 @@ use csgoproto::CDemoFileHeader;
 use csgoproto::CDemoFullPacket;
 use csgoproto::CDemoPacket;
 use csgoproto::CDemoSendTables;
+use csgoproto::CDemoStringTables;
 use csgoproto::CsvcMsgGameEventList;
 use csgoproto::EDemoCommands;
 use prost::Message;
@@ -52,6 +53,7 @@ pub struct ClassInfoThreadResult {
 }
 #[derive(Debug, Clone)]
 pub struct FirstPassOutput<'a> {
+    pub capture_animation_recipes: bool,
     pub fullpacket_offsets: Vec<usize>,
     pub settings: &'a ParserInputs<'a>,
     pub baselines: AHashMap<u32, Vec<u8>>,
@@ -124,6 +126,10 @@ impl<'a> FirstPassParser<'a> {
                 EDemoCommands::DemClassInfo => self.parse_class_info(bytes)?,
                 EDemoCommands::DemSignonPacket => self.parse_packet(bytes)?,
                 EDemoCommands::DemFullPacket => self.parse_full_packet(bytes, &frame)?,
+                EDemoCommands::DemStringTables => {
+                    let tables = CDemoStringTables::decode(bytes).map_err(|_| DemoParserError::MalformedMessage)?;
+                    self.apply_demo_stringtables(&tables);
+                }
                 EDemoCommands::DemStop => break,
                 _ => {}
             };
@@ -210,6 +216,7 @@ impl<'a> FirstPassParser<'a> {
             None => return Err(DemoParserError::ClassMapperNotFoundFirstPass),
         };
         Ok(FirstPassOutput {
+            capture_animation_recipes: true,
             order_by_steamid: self.order_by_steamid,
             header: self.header.clone(),
             fullpacket_offsets: self.fullpacket_offsets.clone(),
@@ -258,6 +265,14 @@ impl<'a> FirstPassParser<'a> {
             Err(_) => return Err(DemoParserError::MalformedMessage),
         };
         if let Some(string_table) = full_packet.string_table {
+            self.apply_demo_stringtables(&string_table);
+        }
+        Ok(())
+    }
+
+    /// Standalone tables carry the same baseline/user-info state as a full packet.
+    /// Round clips emit them explicitly when the chosen checkpoint has no table snapshot.
+    fn apply_demo_stringtables(&mut self, string_table: &CDemoStringTables) {
             for item in &string_table.tables {
                 if item.table_name() == "instancebaseline" {
                     for i in &item.items {
@@ -275,8 +290,6 @@ impl<'a> FirstPassParser<'a> {
                     }
                 }
             }
-        }
-        Ok(())
     }
 }
 
@@ -319,6 +332,7 @@ impl<'a> FirstPassParser<'a> {
         self.header.insert("server_name".to_string(), header.server_name().to_string());
         self.header.insert("client_name".to_string(), header.client_name().to_string());
         self.header.insert("map_name".to_string(), header.map_name().to_string());
+        self.header.insert("server_start_tick".to_string(), header.server_start_tick().to_string());
         self.header.insert("game_directory".to_string(), header.game_directory().to_string());
         self.header.insert("fullpackets_version".to_string(), header.fullpackets_version().to_string());
         self.header

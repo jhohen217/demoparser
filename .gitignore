@@ -7,3 +7,17 @@ perf.data
 perf.data.old
 junk.txt
 voxels.txt
+
+# Parser/writer generated data
+target/
+out/
+*.dem
+*.dem.gz
+*.dem.zst
+*.exe
+*.pdb
+*.dll
+*.duckdb*
+*.s2r
+faceit.ini
+__pycache__/

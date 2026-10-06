@@ -823,8 +823,12 @@ impl DemoParser {
                                 dict.set_item("id", sticker.id)?;
                                 dict.set_item("name", sticker.name.clone())?;
                                 dict.set_item("wear", sticker.wear)?;
-                                dict.set_item("x", sticker.x)?;
-                                dict.set_item("y", sticker.y)?;
+                                dict.set_item("slot", sticker.slot)?;
+                                dict.set_item("scale", sticker.scale)?;
+                                dict.set_item("rotation", sticker.rotation)?;
+                                dict.set_item("offset_x", sticker.offset_x)?;
+                                dict.set_item("offset_y", sticker.offset_y)?;
+                                dict.set_item("schema", sticker.schema)?;
                                 v.push(dict);
                             }
                             dicts.push(v);
@@ -1211,8 +1215,12 @@ fn to_py_sticker_col(pairs: &Vec<&EventField>, _name: &str, py: Python) -> DataF
                     let _ = dict.set_item("id", sticker.id);
                     let _ = dict.set_item("name", sticker.name.clone());
                     let _ = dict.set_item("wear", sticker.wear);
-                    let _ = dict.set_item("x", sticker.x);
-                    let _ = dict.set_item("y", sticker.y);
+                    let _ = dict.set_item("slot", sticker.slot);
+                    let _ = dict.set_item("scale", sticker.scale);
+                    let _ = dict.set_item("rotation", sticker.rotation);
+                    let _ = dict.set_item("offset_x", sticker.offset_x);
+                    let _ = dict.set_item("offset_y", sticker.offset_y);
+                    let _ = dict.set_item("schema", sticker.schema);
                     vv.push(dict);
                 }
                 v.push(vv);
